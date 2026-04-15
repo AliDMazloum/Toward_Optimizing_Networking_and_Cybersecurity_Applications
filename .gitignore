@@ -1,0 +1,18 @@
+*.o
+*.obj
+*.exe
+*.out
+*.exp
+*.lib
+*.pdb
+*.log
+build/
+a.out
+
+# Compiled binaries (names match executable targets)
+dpi_memory_focused
+dpi_memory_focused_energy
+dpi_occupancy_focused
+dpi_occupancy_focused_variant
+dpi_regex_matching
+floyd_warshall_routing
