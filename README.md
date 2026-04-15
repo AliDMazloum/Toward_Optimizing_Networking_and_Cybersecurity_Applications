@@ -1,8 +1,8 @@
 # Toward Optimizing Networking and Cybersecurity Applications Using Domain-Specific Accelerators for Dynamic Programming
 
-This repository contains the CUDA source code accompanying the journal paper:
+This repository contains the CUDA source code accompanying the manuscript:
 
-> **Toward Optimizing Networking and Cybersecurity Applications Using Domain-Specific Accelerators for Dynamic Programming** (IEEE TNSM).
+> **Toward Optimizing Networking and Cybersecurity Applications Using Domain-Specific Accelerators for Dynamic Programming** (under review, IEEE TNSM).
 
 The scripts implement GPU-accelerated versions of two dynamic-programming (DP) workloads that are core to modern networking and cybersecurity stacks:
 
@@ -23,7 +23,6 @@ Each DP algorithm is provided in multiple GPU-optimized variants to study the de
 | [dpi_occupancy_focused_variant.cu](dpi_occupancy_focused_variant.cu) | Smith–Waterman DPI | Alternate occupancy-focused configuration used for ablation runs. |
 | [dpi_regex_matching.cu](dpi_regex_matching.cu) | Smith–Waterman DPI | DPI variant with regular-expression (character-class / metacharacter) support in the signature set. |
 | [floyd_warshall_routing.cu](floyd_warshall_routing.cu) | Floyd–Warshall | GPU all-pairs shortest-path implementation used for the routing case study. |
-| [paper.pdf](paper.pdf) | — | Accepted manuscript of the TNSM paper. |
 
 ---
 
@@ -44,20 +43,20 @@ Each `.cu` file is self-contained and can be compiled directly with `nvcc`.
 Generic build (no NVML, no pthreads):
 
 ```bash
-nvcc -O3 -arch=sm_80 dpi_occupancy_focused.cu -o dpi_occupancy_focused
-nvcc -O3 -arch=sm_80 dpi_occupancy_focused_variant.cu -o dpi_occupancy_focused_variant
-nvcc -O3 -arch=sm_80 dpi_regex_matching.cu -o dpi_regex_matching
+nvcc -O3 -arch=sm_90 dpi_occupancy_focused.cu -o dpi_occupancy_focused
+nvcc -O3 -arch=sm_90 dpi_occupancy_focused_variant.cu -o dpi_occupancy_focused_variant
+nvcc -O3 -arch=sm_90 dpi_regex_matching.cu -o dpi_regex_matching
 ```
 
 Builds that link against NVML and pthreads:
 
 ```bash
-nvcc -O3 -arch=sm_80 dpi_memory_focused.cu        -lnvidia-ml -lpthread -o dpi_memory_focused
-nvcc -O3 -arch=sm_80 dpi_memory_focused_energy.cu -lnvidia-ml -lpthread -o dpi_memory_focused_energy
-nvcc -O3 -arch=sm_80 floyd_warshall_routing.cu    -lnvidia-ml           -o floyd_warshall_routing
+nvcc -O3 -arch=sm_90 dpi_memory_focused.cu        -lnvidia-ml -lpthread -o dpi_memory_focused
+nvcc -O3 -arch=sm_90 dpi_memory_focused_energy.cu -lnvidia-ml -lpthread -o dpi_memory_focused_energy
+nvcc -O3 -arch=sm_90 floyd_warshall_routing.cu    -lnvidia-ml           -o floyd_warshall_routing
 ```
 
-Replace `-arch=sm_80` with the architecture of your GPU (e.g. `sm_70` for V100, `sm_86` for RTX 30xx, `sm_89` for RTX 40xx, `sm_90` for H100).
+The results in the paper were produced on an **NVIDIA H100** (`-arch=sm_90`). Replace the flag with the architecture of your GPU if needed (e.g. `sm_70` for V100, `sm_80` for A100, `sm_86` for RTX 30xx, `sm_89` for RTX 40xx).
 
 On systems where `libnvidia-ml.so` is not on the default library path, add `-L/usr/lib/x86_64-linux-gnu/` (Linux) or point `LIBRARY_PATH` at the directory shipped with your driver.
 
@@ -112,16 +111,7 @@ For power/energy figures, use `dpi_memory_focused_energy.cu`; it spawns an NVML 
 
 ## Citation
 
-If you use this code, please cite the paper:
-
-```bibtex
-@article{mazloum_tnsm_dp_accelerators,
-  title   = {Toward Optimizing Networking and Cybersecurity Applications Using Domain-Specific Accelerators for Dynamic Programming},
-  author  = {Mazloum, Ali and others},
-  journal = {IEEE Transactions on Network and Service Management},
-  year    = {2025}
-}
-```
+A citation entry will be added here once the paper is accepted for publication.
 
 ---
 
