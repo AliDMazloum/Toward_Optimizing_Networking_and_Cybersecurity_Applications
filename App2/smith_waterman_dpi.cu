@@ -53,6 +53,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <pthread.h>
 #include <sched.h>
 #include <time.h>
