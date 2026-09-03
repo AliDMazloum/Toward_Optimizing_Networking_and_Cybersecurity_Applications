@@ -107,7 +107,7 @@ Relevant compile-time parameters (top of each DPI file):
 | `NumberOfSignatures` | Total number of signatures in the database. |
 | `MaxSignatureLength` | Maximum signature length (bytes). |
 | `MatchingIndex` | Index of the signature that is forced to match (used to verify correctness). |
-| `midPoint` | Number of signatures processed per kernel launch. |
+| `midPoint` | Half of the signature set, and the number of threads launched. Each thread scores signature `t` in the low halfword and signature `t + midPoint` in the high halfword of one 32-bit word, which is what `__vimax3_s16x2_relu` operates on. |
 | `blockSize` / `gridSize` | CUDA launch configuration. |
 
 `dpi_memory_focused`, `dpi_memory_focused_energy`, `dpi_occupancy_focused` and
