@@ -34,7 +34,7 @@
 #   make                          build both applications, both architectures
 #   make app1                     build the network resilience system
 #   make app2                     build the deep packet inspection system
-#   make check                    run the eight routing variants and check them
+#   make check                    run the twelve routing variants and check them
 #   make sweep                    run the reported App1 sweep for this TAG
 #   make clean                    remove this tag's binaries
 #   make clean-all                remove every tag, all machines
@@ -121,11 +121,11 @@ $(NVML_TARGETS): %-$(TAG): %.cu Makefile
 $(PLAIN_TARGETS): %-$(TAG): %.cu Makefile
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
-# Runs all eight routing kernel variants once and prints one line each. The last
+# Runs all twelve routing kernel variants once and prints one line each. The last
 # field is the number of matrix entries that disagree with the closed-form
 # answer, and it must be 0 on every line.
 check: $(APP1_TARGETS)
-	@for l in coalesced strided; do \
+	@for l in coalesced strided tiled; do \
 	  for d in on off; do \
 	    for s in always changed; do \
 	      printf '%-10s dpx=%-3s store=%-7s ' "$$l" "$$d" "$$s"; \
@@ -197,7 +197,7 @@ help:
 	@echo "  a100 h200              build both applications"
 	@echo "  a100-app1 h200-app1    the network resilience system only"
 	@echo "  a100-app2 h200-app2    the deep packet inspection system only"
-	@echo "  a100-check h200-check  run the eight routing variants"
+	@echo "  a100-check h200-check  run the twelve routing variants"
 	@echo "  a100-sweep h200-sweep  run the reported App1 sweep"
 	@echo "  a100-clean h200-clean  remove that machine's binaries only"
 	@echo ""
@@ -205,7 +205,7 @@ help:
 	@echo "  all      build both applications (default)"
 	@echo "  app1     build the network resilience system only"
 	@echo "  app2     build the deep packet inspection system only"
-	@echo "  check    build App1 and run its eight kernel variants"
+	@echo "  check    build App1 and run its twelve kernel variants"
 	@echo "  sweep    run the reported App1 sweep for this TAG"
 	@echo "  clean    remove the binaries for this TAG only"
 	@echo "  clean-all remove every tag (do not use while another machine runs)"
