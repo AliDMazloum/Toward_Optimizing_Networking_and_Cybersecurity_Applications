@@ -18,13 +18,21 @@
 #   make                          build both applications
 #   make app1                     build the network resilience system
 #   make app2                     build the deep packet inspection system
-#   make ARCH=sm_80               build for another GPU, for example the A100
+#   make ARCHES=90                build for one architecture only
 #   make check                    run the four routing variants and check them
 #   make clean                    remove the binaries
 
-NVCC      ?= nvcc
-ARCH      ?= sm_90
-NVCCFLAGS ?= -O3 -arch=$(ARCH)
+NVCC ?= nvcc
+
+# Architectures to build for. The default produces one binary carrying native
+# code for both the A100 (sm_80) and the H100 or H200 (sm_90), so the same build
+# can be measured on either GPU. Building for a single architecture and then
+# running on the other one still works, because the driver compiles the embedded
+# PTX, but it does not measure the same machine code, which is a silent way to
+# get a wrong number. Override with, for example, ARCHES=90.
+ARCHES    ?= 80 90
+GENCODE   := $(foreach a,$(ARCHES),-gencode arch=compute_$(a),code=sm_$(a))
+NVCCFLAGS ?= -O3 $(GENCODE)
 NVML_LIBS ?= -lnvidia-ml -lpthread
 
 APP1 := App1
@@ -85,7 +93,7 @@ help:
 	@echo ""
 	@echo "Variables and their current values:"
 	@echo "  NVCC        = $(NVCC)"
-	@echo "  ARCH        = $(ARCH)   (sm_90 for H100 and H200, sm_80 for A100)"
+	@echo "  ARCHES      = $(ARCHES)   (80 is the A100, 90 the H100 and H200)"
 	@echo "  NVCCFLAGS   = $(NVCCFLAGS)"
 	@echo "  NVML_LIBS   = $(NVML_LIBS)"
 	@echo "  CHECK_NODES = $(CHECK_NODES)"

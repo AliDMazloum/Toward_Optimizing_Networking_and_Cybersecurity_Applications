@@ -58,8 +58,11 @@ make check      # build App1 and run its four kernel variants
 make clean
 ```
 
-`ARCH` selects the target architecture and defaults to `sm_90`, so `make ARCH=sm_80` builds for an
-A100. Each file is also self-contained and can be compiled directly:
+By default the Makefile builds one binary carrying native code for both `sm_80` and `sm_90`, so the
+same build runs on an A100 and on an H100 or H200 without recompiling. Building for a single
+architecture and running on the other still works, because the driver compiles the embedded PTX, but
+it no longer measures the same machine code. Override with `make ARCHES=90` when that is what you
+want. Each file is also self-contained and can be compiled directly:
 
 ```bash
 nvcc -O3 -arch=sm_90 App2/dpi_occupancy_focused.cu         -o App2/dpi_occupancy_focused
