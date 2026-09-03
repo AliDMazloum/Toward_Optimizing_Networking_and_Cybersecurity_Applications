@@ -27,7 +27,8 @@
 #   make app1                     build the network resilience system
 #   make app2                     build the deep packet inspection system
 #   make check                    run the eight routing variants and check them
-#   make clean                    remove the binaries, every tag
+#   make clean                    remove this tag's binaries
+#   make clean-all                remove every tag, all machines
 #   make help                     print the variables and their current values
 
 NVCC ?= nvcc
@@ -77,7 +78,7 @@ TARGETS       := $(NVML_TARGETS) $(PLAIN_TARGETS)
 # Problem size used by the check target. Small enough to finish quickly.
 CHECK_NODES ?= 1000
 
-.PHONY: all app1 app2 check clean help
+.PHONY: all app1 app2 check clean clean-all help
 
 all: $(TARGETS)
 
@@ -110,9 +111,17 @@ check: $(APP1_TARGETS)
 	  done; \
 	done
 
-# Removes every tag, not only the current one, and the untagged binaries left by
-# earlier versions of this file.
+# Removes only this invocation's tag, so cleaning on one machine cannot delete
+# the binaries another machine is measuring on a shared file system. Pass the
+# same TAG you built with: make ARCHES=80 TAG=a100 clean.
 clean:
+	rm -f $(TARGETS)
+
+# Removes builds for every tag, and the untagged binaries left by earlier
+# versions of this file. Run it once before the first tagged build, and never
+# while another machine is measuring, because it deletes that machine's
+# binaries too.
+clean-all:
 	rm -f $(foreach t,$(BASE_TARGETS),$(t) $(t)-*)
 
 help:
@@ -121,7 +130,8 @@ help:
 	@echo "  app1     build the network resilience system only"
 	@echo "  app2     build the deep packet inspection system only"
 	@echo "  check    build App1 and run its eight kernel variants"
-	@echo "  clean    remove the built binaries, every tag"
+	@echo "  clean    remove the binaries for this TAG only"
+	@echo "  clean-all remove every tag (do not use while another machine runs)"
 	@echo ""
 	@echo "Variables and their current values:"
 	@echo "  NVCC        = $(NVCC)"

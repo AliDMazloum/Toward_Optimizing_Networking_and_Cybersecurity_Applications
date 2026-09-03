@@ -55,7 +55,8 @@ make            # build everything
 make app1       # the network resilience system only
 make app2       # the deep packet inspection system only
 make check      # build App1 and run its eight kernel variants
-make clean      # remove the binaries, every tag
+make clean      # remove the binaries for this TAG only
+make clean-all  # remove every tag, including other machines'
 ```
 
 Every binary name ends in a tag, so builds for different GPUs can sit side by side on one shared
@@ -66,6 +67,11 @@ tag defaults to the architectures that were built, and `TAG` overrides it with a
 make ARCHES=80 TAG=a100     # -> App1/floyd_warshall_routing-a100
 make ARCHES=90 TAG=h200     # -> App1/floyd_warshall_routing-h200
 ```
+
+`make clean` removes only the binaries for the `TAG` it is given, so pass the same tag you built
+with. `make clean-all` removes every tag, which on a shared file system deletes the binaries another
+machine may be running; use it once before the first tagged build, and not while a measurement is in
+progress.
 
 With no `ARCHES` the Makefile builds one binary carrying native code for both `sm_80` and `sm_90`,
 named `floyd_warshall_routing-sm80-sm90`, which runs on an A100 and on an H100 or H200 without
