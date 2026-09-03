@@ -15,18 +15,27 @@
 #   module load gcc/12.2.0
 #   module load cuda12.4/
 #
-# Then, on the A100 machine and the H200 machine respectively:
+# Then use the target named after the machine you are on. It fixes the
+# architecture, the binary name and the output file, so the two machines cannot
+# collide and there is nothing to remember at the prompt:
 #
-#   make ARCHES=80 TAG=a100
-#   make ARCHES=90 TAG=h200
+#   make a100                     build everything for the A100
+#   make h200                     build everything for the H200
+#   make a100-app1                the network resilience system only
+#   make h200-sweep               build App1 and run the reported sweep
+#   make a100-clean               remove this machine's binaries only
 #
-# which produce App1/floyd_warshall_routing-a100 and
-# App1/floyd_warshall_routing-h200. Other targets:
+# Every one of those refuses to run a sweep if the node's GPU is not the one the
+# target names, so a job landing on the wrong machine fails immediately instead
+# of producing a mislabelled number.
+#
+# The general targets underneath take ARCHES and TAG by hand:
 #
 #   make                          build both applications, both architectures
 #   make app1                     build the network resilience system
 #   make app2                     build the deep packet inspection system
 #   make check                    run the eight routing variants and check them
+#   make sweep                    run the reported App1 sweep for this TAG
 #   make clean                    remove this tag's binaries
 #   make clean-all                remove every tag, all machines
 #   make help                     print the variables and their current values
@@ -78,7 +87,23 @@ TARGETS       := $(NVML_TARGETS) $(PLAIN_TARGETS)
 # Problem size used by the check target. Small enough to finish quickly.
 CHECK_NODES ?= 1000
 
-.PHONY: all app1 app2 check clean clean-all help
+# The App1 sweep reported in the paper. Node counts are the topology sizes the
+# manuscript uses; the flags are the protocol the SC'25 measurements followed, so
+# the two are comparable. Each machine writes its own file, because two processes
+# appending to one file on a shared mount interleave their rows.
+SWEEP_NODES  ?= 1000 2000 3000 6000 12000 24000
+SWEEP_TRIALS ?= 5
+SWEEP_WARMUP ?= 1
+SWEEP_FLAGS  ?= --layout coalesced --store changed --sync per-launch
+SWEEP_CSV    ?= app1_final_$(TAG).csv
+
+# Substring the node's GPU name must contain before a sweep runs. The machine
+# targets set it; set it to nothing to skip the check.
+GPU_MATCH ?=
+
+.PHONY: all app1 app2 check sweep clean clean-all help
+.PHONY: a100 a100-app1 a100-app2 a100-check a100-sweep a100-clean
+.PHONY: h200 h200-app1 h200-app2 h200-check h200-sweep h200-clean
 
 all: $(TARGETS)
 
@@ -111,6 +136,49 @@ check: $(APP1_TARGETS)
 	  done; \
 	done
 
+# Runs the App1 sweep the paper reports, appending to one file per machine. It
+# stops at the first failure rather than leaving a half-finished file that looks
+# complete.
+sweep: $(APP1_TARGETS)
+	@if [ -n "$(GPU_MATCH)" ]; then \
+	  name=$$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1); \
+	  case "$$name" in \
+	    *$(GPU_MATCH)*) echo "# node gpu: $$name" ;; \
+	    *) echo "This node reports '$$name', not a $(GPU_MATCH). Refusing to"; \
+	       echo "write $(SWEEP_CSV). Use the target for this machine, or pass"; \
+	       echo "GPU_MATCH= to skip the check."; \
+	       exit 1 ;; \
+	  esac; \
+	fi; \
+	echo "# writing $(SWEEP_CSV)"; \
+	for n in $(SWEEP_NODES); do \
+	  for d in on off; do \
+	    ./$(APP1_TARGETS) --nodes $$n --dpx $$d $(SWEEP_FLAGS) \
+	      --trials $(SWEEP_TRIALS) --warmup $(SWEEP_WARMUP) \
+	      --csv $(SWEEP_CSV) || exit 1; \
+	  done; \
+	done
+
+# Machine shortcuts. Each fixes the architecture, the name tag, the output file
+# and the GPU the sweep insists on, so nothing about one machine can reach the
+# other. Adding a machine means one pair of lines here.
+A100 = ARCHES=80 TAG=a100 GPU_MATCH=A100
+H200 = ARCHES=90 TAG=h200 GPU_MATCH=H200
+
+a100:       ; @$(MAKE) --no-print-directory $(A100) all
+a100-app1:  ; @$(MAKE) --no-print-directory $(A100) app1
+a100-app2:  ; @$(MAKE) --no-print-directory $(A100) app2
+a100-check: ; @$(MAKE) --no-print-directory $(A100) check
+a100-sweep: ; @$(MAKE) --no-print-directory $(A100) sweep
+a100-clean: ; @$(MAKE) --no-print-directory $(A100) clean
+
+h200:       ; @$(MAKE) --no-print-directory $(H200) all
+h200-app1:  ; @$(MAKE) --no-print-directory $(H200) app1
+h200-app2:  ; @$(MAKE) --no-print-directory $(H200) app2
+h200-check: ; @$(MAKE) --no-print-directory $(H200) check
+h200-sweep: ; @$(MAKE) --no-print-directory $(H200) sweep
+h200-clean: ; @$(MAKE) --no-print-directory $(H200) clean
+
 # Removes only this invocation's tag, so cleaning on one machine cannot delete
 # the binaries another machine is measuring on a shared file system. Pass the
 # same TAG you built with: make ARCHES=80 TAG=a100 clean.
@@ -125,11 +193,20 @@ clean-all:
 	rm -f $(foreach t,$(BASE_TARGETS),$(t) $(t)-*)
 
 help:
-	@echo "Targets:"
+	@echo "Machine targets, which set everything for you:"
+	@echo "  a100 h200              build both applications"
+	@echo "  a100-app1 h200-app1    the network resilience system only"
+	@echo "  a100-app2 h200-app2    the deep packet inspection system only"
+	@echo "  a100-check h200-check  run the eight routing variants"
+	@echo "  a100-sweep h200-sweep  run the reported App1 sweep"
+	@echo "  a100-clean h200-clean  remove that machine's binaries only"
+	@echo ""
+	@echo "General targets, which need ARCHES and TAG:"
 	@echo "  all      build both applications (default)"
 	@echo "  app1     build the network resilience system only"
 	@echo "  app2     build the deep packet inspection system only"
 	@echo "  check    build App1 and run its eight kernel variants"
+	@echo "  sweep    run the reported App1 sweep for this TAG"
 	@echo "  clean    remove the binaries for this TAG only"
 	@echo "  clean-all remove every tag (do not use while another machine runs)"
 	@echo ""
@@ -140,6 +217,9 @@ help:
 	@echo "  NVCCFLAGS   = $(NVCCFLAGS)"
 	@echo "  NVML_LIBS   = $(NVML_LIBS)"
 	@echo "  CHECK_NODES = $(CHECK_NODES)"
+	@echo "  SWEEP_NODES = $(SWEEP_NODES)"
+	@echo "  SWEEP_CSV   = $(SWEEP_CSV)"
+	@echo "  GPU_MATCH   = $(GPU_MATCH)"
 	@echo ""
 	@echo "Binaries this invocation would build:"
 	@echo "  $(TARGETS)"

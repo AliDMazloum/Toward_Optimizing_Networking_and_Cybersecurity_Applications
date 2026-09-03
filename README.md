@@ -50,30 +50,49 @@ The repository is split by application: `App1` holds the network resilience syst
 the deep packet inspection system. A `Makefile` at the top level builds both, and places each binary
 next to its source:
 
-```bash
-make            # build everything
-make app1       # the network resilience system only
-make app2       # the deep packet inspection system only
-make check      # build App1 and run its eight kernel variants
-make clean      # remove the binaries for this TAG only
-make clean-all  # remove every tag, including other machines'
-```
+### One target per machine
 
-Every binary name ends in a tag, so builds for different GPUs can sit side by side on one shared
-file system and both machines can be measured at the same time without overwriting each other. The
-tag defaults to the architectures that were built, and `TAG` overrides it with a name of your own:
+The two GPUs used for the reported results sit on nodes that share a file system, so a build for one
+would overwrite the binary the other is running. The Makefile therefore names every binary after the
+machine it was built for, and offers one target per machine that sets the architecture, the name and
+the output file together. Nothing has to be remembered at the prompt:
 
 ```bash
-make ARCHES=80 TAG=a100     # -> App1/floyd_warshall_routing-a100
-make ARCHES=90 TAG=h200     # -> App1/floyd_warshall_routing-h200
+make h200         # build both applications for the H200
+make h200-app1    # the network resilience system only
+make h200-check   # run App1's eight kernel variants and check them
+make h200-sweep   # run the App1 sweep reported in the paper
+make h200-clean   # remove this machine's binaries and nothing else
 ```
 
-`make clean` removes only the binaries for the `TAG` it is given, so pass the same tag you built
-with. `make clean-all` removes every tag, which on a shared file system deletes the binaries another
-machine may be running; use it once before the first tagged build, and not while a measurement is in
-progress.
+and the same six with `a100`. `make h200` produces `App1/floyd_warshall_routing-h200`, `make a100`
+produces `App1/floyd_warshall_routing-a100`, and both can be built and measured at the same time.
 
-With no `ARCHES` the Makefile builds one binary carrying native code for both `sm_80` and `sm_90`,
+`h200-sweep` writes `app1_final_h200.csv` and `a100-sweep` writes `app1_final_a100.csv`, so the two
+machines never append to one file. Before running anything, a sweep asks the node which GPU it has
+and refuses if the answer does not match the target's name, which catches a job that landed on the
+wrong machine before it produces a mislabelled number. `SWEEP_NODES`, `SWEEP_TRIALS`, `SWEEP_WARMUP`,
+`SWEEP_FLAGS` and `SWEEP_CSV` override what it runs and where it writes.
+
+### The general targets
+
+The machine targets are shorthand for these, which take the architecture and the tag by hand:
+
+```bash
+make ARCHES=90 TAG=h200            # build everything
+make ARCHES=90 TAG=h200 app1       # the network resilience system only
+make ARCHES=90 TAG=h200 app2       # the deep packet inspection system only
+make ARCHES=90 TAG=h200 check      # build App1 and run its eight kernel variants
+make ARCHES=90 TAG=h200 sweep      # run the reported App1 sweep
+make ARCHES=90 TAG=h200 clean      # remove the binaries for this tag only
+make clean-all                     # remove every tag, including other machines'
+```
+
+`clean` removes only the binaries for the tag it is given. `clean-all` removes every tag, which on a
+shared file system deletes the binaries another machine may be running; use it once before the first
+tagged build, and not while a measurement is in progress.
+
+With neither `ARCHES` nor `TAG` the Makefile builds one binary carrying native code for both `sm_80` and `sm_90`,
 named `floyd_warshall_routing-sm80-sm90`, which runs on an A100 and on an H100 or H200 without
 recompiling. Building for a single architecture and running on the other still works, because the
 driver compiles the embedded PTX, but it no longer measures the same machine code. Each file is also
@@ -172,9 +191,13 @@ rebuilds:
 ./App1/floyd_warshall_routing-h200 --nodes 24000 --layout coalesced --dpx on --trials 10 --warmup 1 --energy --csv results_h200.csv
 ```
 
-Give each machine its own `--csv` file. Two runs appending to one file on a shared file system
-interleave their rows and can tear a line. Every row records the GPU it came from in the `gpu`
-column, so a merge afterwards is safe and an accidental mixture is still readable.
+The sweep reported in the paper is `make h200-sweep` or `make a100-sweep`, which fills these flags
+in for you and writes one file per machine.
+
+If you call the program directly, give each machine its own `--csv` file. Two runs appending to one
+file on a shared file system interleave their rows and can tear a line. Every row records the GPU it
+came from in the `gpu` column, so a merge afterwards is safe and an accidental mixture is still
+readable.
 
 | Option | Meaning |
 |--------|---------|
