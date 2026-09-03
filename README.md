@@ -22,7 +22,7 @@ Each DP algorithm is provided in multiple GPU-optimized variants to study the de
 | [dpi_occupancy_focused.cu](dpi_occupancy_focused.cu) | Smith–Waterman DPI | Occupancy-optimized kernel (smaller block size, higher active warps per SM). |
 | [dpi_occupancy_focused_variant.cu](dpi_occupancy_focused_variant.cu) | Smith–Waterman DPI | Alternate occupancy-focused configuration used for ablation runs. |
 | [dpi_regex_matching.cu](dpi_regex_matching.cu) | Smith–Waterman DPI | DPI variant with regular-expression (character-class / metacharacter) support in the signature set. |
-| [floyd_warshall_routing.cu](floyd_warshall_routing.cu) | Floyd–Warshall | GPU all-pairs shortest-path implementation used for the routing case study. |
+| [floyd_warshall_routing.cu](floyd_warshall_routing.cu) | Floyd–Warshall | GPU all-pairs shortest path for the routing case study. Carries both thread-to-data mappings and both DPX states, selected by command-line flags, with repeated trials and optional NVML energy sampling. |
 
 ---
 
@@ -33,7 +33,8 @@ Each DP algorithm is provided in multiple GPU-optimized variants to study the de
   kernels and `__vibmin_s32` in the Floyd–Warshall kernel. DPX was introduced with the NVIDIA
   Hopper architecture, so a pre-Hopper GPU does not run these operations on DPX hardware.
 - **CUDA Toolkit 12.0 or newer** (`nvcc`). The DPX math APIs used here are exposed by CUDA 12.
-- **NVML** (ships with the NVIDIA driver), required by the two memory-focused DPI variants.
+- **NVML** (ships with the NVIDIA driver), required by the two memory-focused DPI
+  variants and by the routing program.
 - **POSIX threads** (`pthread`), used by the NVML power-polling thread.
 - A Linux environment. The energy-measurement path uses `clock_gettime(CLOCK_MONOTONIC)`,
   `nanosleep` and pthreads, so it does not build unmodified on Windows; use WSL2 with the
@@ -58,12 +59,7 @@ Builds that link against NVML and pthreads:
 ```bash
 nvcc -O3 -arch=sm_90 dpi_memory_focused.cu        -lnvidia-ml -lpthread -o dpi_memory_focused
 nvcc -O3 -arch=sm_90 dpi_memory_focused_energy.cu -lnvidia-ml -lpthread -o dpi_memory_focused_energy
-```
-
-Floyd–Warshall needs neither library:
-
-```bash
-nvcc -O3 -arch=sm_90 floyd_warshall_routing.cu -o floyd_warshall_routing
+nvcc -O3 -arch=sm_90 floyd_warshall_routing.cu    -lnvidia-ml -lpthread -o floyd_warshall_routing
 ```
 
 The results in the paper were produced on an **NVIDIA H100** (`-arch=sm_90`). Replace the flag with the architecture of your GPU if needed (e.g. `sm_70` for V100, `sm_80` for A100, `sm_86` for RTX 30xx, `sm_89` for RTX 40xx).
@@ -122,7 +118,7 @@ Relevant compile-time parameters (top of each DPI file):
 it used on the first line of output:
 
 ```bash
-./dpi_regex_matching --p_size 512 --s_count 10000 --s_len 16 --m_idx 1356                      --block 32 1 1 --grid 313 1 1 --verbose
+./dpi_regex_matching --p_size 512 --s_count 10000 --s_len 16 --m_idx 1356 --block 32 1 1 --grid 313 1 1 --verbose
 ```
 
 | Option | Meaning |
@@ -142,16 +138,38 @@ integrated over the kernel window.
 
 ### Floyd–Warshall
 
-Edit `Ver` (graph vertex count) at the top of [floyd_warshall_routing.cu](floyd_warshall_routing.cu) and rebuild. Then:
+The routing program takes every parameter on the command line, so a sweep needs no edits and no
+rebuilds:
 
 ```bash
-./floyd_warshall_routing
+./floyd_warshall_routing --nodes 24000 --layout coalesced --dpx on --trials 10 --warmup 1 --energy --csv results.csv
 ```
 
-The program prints the total execution time for computing the all-pairs shortest paths. It builds a
-directed chain graph, in which vertex `i` has a single outgoing edge to vertex `i + 1` of weight 1,
-so the correct distance matrix is known in closed form. After the GPU run it asserts that every
-entry equals `j - i` for `j >= i` and `INF` otherwise, and aborts if any entry disagrees.
+| Option | Meaning |
+|--------|---------|
+| `--nodes <int>` | Number of vertices. Default 12000. |
+| `--layout <name>` | `coalesced`, in which a block strides over rows and a thread over columns, or `strided`, the non-coalesced mapping in which consecutive threads address entries `nodes` apart. Default `coalesced`. |
+| `--dpx <state>` | `on` uses `__viaddmin_s32`; `off` computes the same value with an add and a minimum, which is the DPX-off arm on the same GPU. Default `on`. |
+| `--trials <int>` | Measured repetitions. Default 1. |
+| `--warmup <int>` | Unmeasured repetitions run first. Default 1. |
+| `--cpu` | Run the serial host reference instead of the GPU. |
+| `--energy` | Sample GPU power with NVML and report energy per trial. |
+| `--poll-ms <int>` | NVML sampling interval in milliseconds. Default 1. |
+| `--device <int>` | CUDA and NVML device index. Default 0. |
+| `--csv <path>` | Append one row per trial, with every setting, to this file. |
+| `--power-csv <path>` | Write every power sample to this file. |
+| `--no-verify` | Skip the correctness check. |
+
+The block size is fixed at 256 threads, which performed best in our measurements. The block count is
+not fixed and not hand-picked: it is the smaller of the work available and the number of blocks the
+device can hold resident for the selected kernel, obtained from the occupancy API and the SM count.
+Every run prints the derived value along with all other settings, so the output documents the
+configuration that produced it.
+
+The topology is a directed chain in which vertex `i` has one outgoing edge to vertex `i + 1` of
+weight 1, so the correct distance matrix is known in closed form. Unless `--no-verify` is given,
+every trial is checked entry by entry against `j - i` for `j >= i` and `INF` otherwise, and the
+number of mismatching entries is reported.
 
 ---
 
@@ -167,28 +185,31 @@ lists what is set in this release, so that a reported number can be traced to a 
 | `dpi_occupancy_focused.cu` | `PayloadSize 512`, `MaxSignatureLength 16`, `NumberOfSignatures 10000000`, `midPoint 5000000`, `MatchingIndex 99152` | `blockSize 64`, `gridSize = 78125` |
 | `dpi_occupancy_focused_variant.cu` | same as above | same as above |
 | `dpi_regex_matching.cu` | `PayloadSize 50`, `MaxSignatureLength 20`, `NumberOfSignatures 10000`, `MatchingIndex 1356` | default block `(10, 1, 1)`, grid derived from the signature count; both overridable on the command line |
-| `floyd_warshall_routing.cu` | `Ver 12000`, `INF 99999` | `blockSize 256`, `gridSize 2048`, one kernel launch per intermediate vertex |
+| `floyd_warshall_routing.cu` | Set by `--nodes`, default 12000. `INF 99999` | 256 threads per block, block count derived per run, one kernel launch per intermediate vertex |
 
 Scoring parameters are `match = 2`, `mismatch = -1` and `indel = -1` in the four plain DPI variants,
 and `match = 6`, `mismatch = -3` and `indel = -2` in the regex variant.
 
 The paper's second DPI configuration, `(1024, 32)`, is obtained by setting `PayloadSize` to 1024 and
 `MaxSignatureLength` to 32. Each signature-count point in the sweeps is obtained by setting
-`NumberOfSignatures`, with `midPoint` at half that value, and recompiling. For Floyd–Warshall, each
-topology size is obtained by setting `Ver`.
+`NumberOfSignatures`, with `midPoint` at half that value, and recompiling. For Floyd–Warshall,
+nothing needs recompiling: each topology size, mapping and DPX state is a command-line flag.
 
 ### How time and energy are measured
 
 - **DPI processing time** comes from CUDA events (`cudaEventRecord` before and after the kernel
   launch, then `cudaEventElapsedTime`). Signature generation and the host-to-device copies sit
   outside the timed region, so the figure is kernel time alone.
-- **Floyd–Warshall processing time** comes from `clock()` around the whole loop of per-vertex kernel
-  launches, each followed by `cudaDeviceSynchronize()`. The host-to-device and device-to-host copies
-  sit outside the timed region, so the figure covers the kernel launches and their synchronization.
-- **Energy** is measured by a separate pthread that calls `nvmlDeviceGetPowerUsage` every 1 ms on
-  device 0 and appends to `DPI_Power_Log.csv` with monotonic timestamps. The thread starts 100 ms
-  before the kernel and stops 100 ms after it, and the program then integrates the samples that fall
-  inside the kernel window. Use `dpi_memory_focused_energy.cu` for the energy figures.
+- **Floyd–Warshall processing time** is reported twice per trial, so the measurement window is never
+  ambiguous. The *kernel* time comes from CUDA events around the per-vertex launches alone. The
+  *end to end* time comes from a monotonic host clock and additionally covers the host-to-device copy
+  of the distance matrix and the copy of the result back. Rebuilding the input matrix between trials
+  falls outside both windows.
+- **Energy** is measured by a separate pthread that calls `nvmlDeviceGetPowerUsage` every 1 ms and
+  keeps its samples in memory, so no file writing happens inside a measured window. Energy for a
+  trial is the trapezoidal integral of the samples whose timestamps fall inside that trial's end to
+  end window; a window holding fewer than two samples is reported as missing rather than estimated.
+  Use `dpi_memory_focused_energy.cu` for the DPI energy figures and `--energy` for the routing ones.
 
 ---
 
