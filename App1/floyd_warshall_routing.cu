@@ -42,10 +42,13 @@
 // Fixed parameters
 // ---------------------------------------------------------------------------
 
-// 256 threads per block was the best performing block size in our measurements.
-// The block count is not fixed: it is derived per run from the problem size and
-// from what the device can hold, in derive_grid() below.
-#define BLOCK_THREADS 256
+// 256 threads per block was the best performing block size in our
+// measurements, so it is the default; --block overrides it for the flat
+// layouts, for block size studies. The block count is still derived per run
+// from the problem size and from what the device can hold, in derive_grid()
+// below. The tiled layout takes no block size: its block is fixed by the tile
+// geometry at TILE x TILE threads.
+#define BLOCK_THREADS_DEFAULT 256
 
 // Tile width of the tiled layout. 32 is the warp width, so one tile row is one
 // warp and a 32 x 32 block is 1024 threads, the hardware maximum per block.
@@ -534,23 +537,23 @@ static FwKernel select_kernel(bool coalesced, bool use_dpx, bool store_changed)
 // A launch cannot go through a function pointer, so the same choice is spelled
 // out once here rather than at every call site.
 static void launch_relaxation(bool coalesced, bool use_dpx, bool store_changed,
-                              int grid, int V, int k, int *dis_d)
+                              int grid, int block, int V, int k, int *dis_d)
 {
     if (coalesced) {
         if (use_dpx) {
-            if (store_changed) fw_coalesced<true, true><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
-            else               fw_coalesced<true, false><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
+            if (store_changed) fw_coalesced<true, true><<<grid, block>>>(V, k, dis_d);
+            else               fw_coalesced<true, false><<<grid, block>>>(V, k, dis_d);
         } else {
-            if (store_changed) fw_coalesced<false, true><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
-            else               fw_coalesced<false, false><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
+            if (store_changed) fw_coalesced<false, true><<<grid, block>>>(V, k, dis_d);
+            else               fw_coalesced<false, false><<<grid, block>>>(V, k, dis_d);
         }
     } else {
         if (use_dpx) {
-            if (store_changed) fw_strided<true, true><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
-            else               fw_strided<true, false><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
+            if (store_changed) fw_strided<true, true><<<grid, block>>>(V, k, dis_d);
+            else               fw_strided<true, false><<<grid, block>>>(V, k, dis_d);
         } else {
-            if (store_changed) fw_strided<false, true><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
-            else               fw_strided<false, false><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
+            if (store_changed) fw_strided<false, true><<<grid, block>>>(V, k, dis_d);
+            else               fw_strided<false, false><<<grid, block>>>(V, k, dis_d);
         }
     }
 }
@@ -586,7 +589,7 @@ static void launch_tiled_round(bool use_dpx, bool store_changed,
     }
 }
 
-static int derive_grid(FwKernel kernel, int V, bool strided_layout,
+static int derive_grid(FwKernel kernel, int V, bool strided_layout, int block,
                        int *blocks_per_sm_out, int *sm_count_out)
 {
     int blocks_per_sm = 0;
@@ -596,14 +599,14 @@ static int derive_grid(FwKernel kernel, int V, bool strided_layout,
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &blocks_per_sm, kernel, BLOCK_THREADS, 0));
+        &blocks_per_sm, kernel, block, 0));
 
     const long long resident = (long long)prop.multiProcessorCount * blocks_per_sm;
 
     // Work available, in blocks, if every thread took one item.
     long long work;
     if (strided_layout) {
-        work = (((long long)V * V) + BLOCK_THREADS - 1) / BLOCK_THREADS;
+        work = (((long long)V * V) + block - 1) / block;
     } else {
         work = V;  // one block per row
     }
@@ -647,6 +650,10 @@ static void print_usage(const char *prog)
     printf("  --dpx <state>       on | off (default on)\n");
     printf("  --store <policy>    always | changed: write every cell, or only\n");
     printf("                      the cells whose value improves (default always)\n");
+    printf("  --block <int>       threads per block for the flat layouts\n");
+    printf("                      (default %d; the tiled layout's block is fixed\n",
+           BLOCK_THREADS_DEFAULT);
+    printf("                      by the tile geometry)\n");
     printf("  --trials <int>      measured repetitions (default 1)\n");
     printf("  --warmup <int>      unmeasured repetitions first (default 1)\n");
     printf("  --sync <state>      per-launch | none: host synchronization after\n");
@@ -675,6 +682,8 @@ int main(int argc, char **argv)
     bool  verify      = true;
     bool  sync_each   = true;
     bool  store_changed = false;
+    int   block_threads = BLOCK_THREADS_DEFAULT;
+    bool  block_set   = false;
     const char *csv_path = NULL;
     const char *power_csv_path = NULL;
 
@@ -704,6 +713,9 @@ int main(int argc, char **argv)
             if (!strcmp(v, "always"))       store_changed = false;
             else if (!strcmp(v, "changed")) store_changed = true;
             else { fprintf(stderr, "Unknown store policy: %s\n", v); return 1; }
+        } else if (!strcmp(argv[i], "--block") && i + 1 < argc) {
+            block_threads = atoi(argv[++i]);
+            block_set = true;
         } else if (!strcmp(argv[i], "--sync") && i + 1 < argc) {
             const char *v = argv[++i];
             if (!strcmp(v, "per-launch"))  sync_each = true;
@@ -733,6 +745,15 @@ int main(int argc, char **argv)
     if (V < 2)       { fprintf(stderr, "--nodes must be at least 2\n"); return 1; }
     if (trials < 1)  { fprintf(stderr, "--trials must be at least 1\n"); return 1; }
     if (warmup < 0)  { fprintf(stderr, "--warmup cannot be negative\n"); return 1; }
+    if (block_threads < 1 || block_threads > 1024) {
+        fprintf(stderr, "--block must be between 1 and 1024\n");
+        return 1;
+    }
+    if (block_set && layout == LAYOUT_TILED) {
+        fprintf(stderr, "--block does not apply to the tiled layout, whose"
+                        " block is fixed at %d x %d threads\n", TILE, TILE);
+        return 1;
+    }
 
     // The tiled layout computes on a matrix padded up to a whole number of
     // tiles; the correctness check still reads only the real V x V entries.
@@ -765,7 +786,7 @@ int main(int argc, char **argv)
             FwKernel kernel = select_kernel(layout == LAYOUT_COALESCED,
                                             use_dpx, store_changed);
             grid = derive_grid(kernel, V, layout == LAYOUT_STRIDED,
-                               &blocks_per_sm, &sm_count);
+                               block_threads, &blocks_per_sm, &sm_count);
         }
     }
 
@@ -789,7 +810,7 @@ int main(int argc, char **argv)
                    nb - 1, nb - 1, nb - 1);
             printf("# launches_per_trial: %d\n", nb > 1 ? 3 * nb : 1);
         } else {
-            printf("# block_threads     : %d\n", BLOCK_THREADS);
+            printf("# block_threads     : %d\n", block_threads);
             printf("# grid_blocks       : %d (min of work and %d SMs x %d resident blocks)\n",
                    grid, sm_count, blocks_per_sm);
             printf("# launches_per_trial: %d\n", V);
@@ -858,7 +879,8 @@ int main(int argc, char **argv)
             } else {
                 for (int k = 0; k < V; k++) {
                     launch_relaxation(layout == LAYOUT_COALESCED, use_dpx,
-                                      store_changed, grid, V, k, dis_d);
+                                      store_changed, grid, block_threads,
+                                      V, k, dis_d);
                     // Launches on one stream already run in order, so the
                     // synchronization is not needed for correctness. It is the
                     // default because it is what the originally reported
@@ -916,7 +938,7 @@ int main(int argc, char **argv)
                         run_cpu ? "n/a" : (use_dpx ? "on" : "off"),
                         run_cpu ? "n/a" : (store_changed ? "changed" : "always"),
                         run_cpu ? "n/a" : (sync_each ? "per-launch" : "none"),
-                        run_cpu ? 0 : (tiled ? TILE * TILE : BLOCK_THREADS),
+                        run_cpu ? 0 : (tiled ? TILE * TILE : block_threads),
                         run_cpu ? 0 : grid,
                         t + 1, kernel_s[t], endtoend_s[t]);
                 if (measure_energy && !run_cpu && energy_ok[t])
