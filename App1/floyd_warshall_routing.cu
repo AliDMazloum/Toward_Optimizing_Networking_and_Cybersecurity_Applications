@@ -401,6 +401,8 @@ static void print_usage(const char *prog)
     printf("  --dpx <state>       on | off (default on)\n");
     printf("  --trials <int>      measured repetitions (default 1)\n");
     printf("  --warmup <int>      unmeasured repetitions first (default 1)\n");
+    printf("  --sync <state>      per-launch | none: host synchronization after\n");
+    printf("                      each launch (default per-launch)\n");
     printf("  --cpu               run the serial host reference instead of the GPU\n");
     printf("  --energy            sample GPU power with NVML and report energy\n");
     printf("  --poll-ms <int>     NVML sampling interval, ms (default 1)\n");
@@ -423,6 +425,7 @@ int main(int argc, char **argv)
     long  poll_ms     = 1;
     int   device      = 0;
     bool  verify      = true;
+    bool  sync_each   = true;
     const char *csv_path = NULL;
     const char *power_csv_path = NULL;
 
@@ -446,6 +449,11 @@ int main(int argc, char **argv)
             trials = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--warmup") && i + 1 < argc) {
             warmup = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--sync") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "per-launch"))  sync_each = true;
+            else if (!strcmp(v, "none"))   sync_each = false;
+            else { fprintf(stderr, "Unknown sync state: %s\n", v); return 1; }
         } else if (!strcmp(argv[i], "--cpu")) {
             run_cpu = true;
         } else if (!strcmp(argv[i], "--energy")) {
@@ -507,6 +515,8 @@ int main(int argc, char **argv)
         printf("# grid_blocks       : %d (min of work and %d SMs x %d resident blocks)\n",
                grid, sm_count, blocks_per_sm);
         printf("# launches_per_trial: %d\n", V);
+        printf("# sync              : %s\n",
+               sync_each ? "per launch" : "none, launches are queued");
     }
     printf("# trials            : %d\n", trials);
     printf("# warmup            : %d (not reported)\n", warmup);
@@ -570,10 +580,12 @@ int main(int argc, char **argv)
                     if (use_dpx) fw_strided<true><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
                     else         fw_strided<false><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
                 }
-                // Launches on one stream already run in order, so this is not
-                // needed for correctness. It is kept because it is what the
-                // originally reported measurements did.
-                CUDA_CHECK(cudaDeviceSynchronize());
+                // Launches on one stream already run in order, so the
+                // synchronization is not needed for correctness. It is the
+                // default because it is what the originally reported
+                // measurements did, and --sync none drops it so that the host
+                // can queue the launches instead of waiting for each one.
+                if (sync_each) CUDA_CHECK(cudaDeviceSynchronize());
             }
             CUDA_CHECK(cudaEventRecord(ev_stop, 0));
             CUDA_CHECK(cudaEventSynchronize(ev_stop));
@@ -613,13 +625,14 @@ int main(int argc, char **argv)
             } else {
                 fseek(f, 0, SEEK_END);
                 if (ftell(f) == 0)
-                    fprintf(f, "nodes,target,layout,dpx,block_threads,grid_blocks,"
-                               "trial,kernel_s,endtoend_s,energy_j,mean_power_w,"
-                               "power_samples,mismatches\n");
-                fprintf(f, "%d,%s,%s,%s,%d,%d,%d,%.6f,%.6f,",
+                    fprintf(f, "nodes,target,layout,dpx,sync,block_threads,"
+                               "grid_blocks,trial,kernel_s,endtoend_s,energy_j,"
+                               "mean_power_w,power_samples,mismatches\n");
+                fprintf(f, "%d,%s,%s,%s,%s,%d,%d,%d,%.6f,%.6f,",
                         V, run_cpu ? "cpu" : "gpu",
                         run_cpu ? "n/a" : (coalesced ? "coalesced" : "strided"),
                         run_cpu ? "n/a" : (use_dpx ? "on" : "off"),
+                        run_cpu ? "n/a" : (sync_each ? "per-launch" : "none"),
                         run_cpu ? 0 : BLOCK_THREADS, run_cpu ? 0 : grid,
                         t + 1, kernel_s[t], endtoend_s[t]);
                 if (measure_energy && !run_cpu && energy_ok[t])

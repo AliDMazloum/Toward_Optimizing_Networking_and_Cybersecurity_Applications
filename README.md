@@ -17,21 +17,23 @@ Each DP algorithm is provided in multiple GPU-optimized variants to study the de
 
 | File | Algorithm | Focus |
 |------|-----------|-------|
-| [dpi_memory_focused.cu](dpi_memory_focused.cu) | Smith–Waterman DPI | Memory-bandwidth optimized kernel (large payload / signature set, instrumented with NVML for power/energy logging). |
-| [dpi_memory_focused_energy.cu](dpi_memory_focused_energy.cu) | Smith–Waterman DPI | Memory-focused kernel with a dedicated NVML power-polling thread used for the energy-consumption measurements reported in the paper. |
-| [dpi_occupancy_focused.cu](dpi_occupancy_focused.cu) | Smith–Waterman DPI | Occupancy-optimized kernel (smaller block size, higher active warps per SM). |
-| [dpi_occupancy_focused_variant.cu](dpi_occupancy_focused_variant.cu) | Smith–Waterman DPI | Alternate occupancy-focused configuration used for ablation runs. |
-| [dpi_regex_matching.cu](dpi_regex_matching.cu) | Smith–Waterman DPI | DPI variant with regular-expression (character-class / metacharacter) support in the signature set. |
-| [floyd_warshall_routing.cu](floyd_warshall_routing.cu) | Floyd–Warshall | GPU all-pairs shortest path for the routing case study. Carries both thread-to-data mappings and both DPX states, selected by command-line flags, with repeated trials and optional NVML energy sampling. |
+| [dpi_memory_focused.cu](App2/dpi_memory_focused.cu) | Smith–Waterman DPI | Memory-bandwidth optimized kernel (large payload / signature set, instrumented with NVML for power/energy logging). |
+| [dpi_memory_focused_energy.cu](App2/dpi_memory_focused_energy.cu) | Smith–Waterman DPI | Memory-focused kernel with a dedicated NVML power-polling thread used for the energy-consumption measurements reported in the paper. |
+| [dpi_occupancy_focused.cu](App2/dpi_occupancy_focused.cu) | Smith–Waterman DPI | Occupancy-optimized kernel (smaller block size, higher active warps per SM). |
+| [dpi_occupancy_focused_variant.cu](App2/dpi_occupancy_focused_variant.cu) | Smith–Waterman DPI | Alternate occupancy-focused configuration used for ablation runs. |
+| [dpi_regex_matching.cu](App2/dpi_regex_matching.cu) | Smith–Waterman DPI | DPI variant with regular-expression (character-class / metacharacter) support in the signature set. |
+| [floyd_warshall_routing.cu](App1/floyd_warshall_routing.cu) | Floyd–Warshall | GPU all-pairs shortest path for the routing case study. Carries both thread-to-data mappings and both DPX states, selected by command-line flags, with repeated trials and optional NVML energy sampling. |
 
 ---
 
 ## Requirements
 
-- **NVIDIA GPU with compute capability 9.0** (Hopper, for example the H100) to execute the DPX
-  instructions in hardware. The kernels call two DPX intrinsics: `__vimax3_s16x2_relu` in the DPI
-  kernels and `__vibmin_s32` in the Floyd–Warshall kernel. DPX was introduced with the NVIDIA
-  Hopper architecture, so a pre-Hopper GPU does not run these operations on DPX hardware.
+- **NVIDIA GPU with compute capability 9.0** (Hopper, for example the H100 or H200) to execute the
+  DPX instructions in hardware. The kernels call two DPX intrinsics: `__vimax3_s16x2_relu` in the
+  DPI kernels and `__viaddmin_s32` in the Floyd–Warshall kernel. DPX was introduced with the NVIDIA
+  Hopper architecture, so a pre-Hopper GPU does not run these operations on DPX hardware. The
+  routing program can also be built and run with `--dpx off`, which computes the same values with
+  an ordinary add and minimum on the same GPU.
 - **CUDA Toolkit 12.0 or newer** (`nvcc`). The DPX math APIs used here are exposed by CUDA 12.
 - **NVML** (ships with the NVIDIA driver), required by the two memory-focused DPI
   variants and by the routing program.
@@ -44,22 +46,28 @@ Each DP algorithm is provided in multiple GPU-optimized variants to study the de
 
 ## Building
 
-Each `.cu` file is self-contained and can be compiled directly with `nvcc`.
-
-Generic build (no NVML, no pthreads):
+The repository is split by application: `App1` holds the network resilience system and `App2` holds
+the deep packet inspection system. A `Makefile` at the top level builds both, and places each binary
+next to its source:
 
 ```bash
-nvcc -O3 -arch=sm_90 dpi_occupancy_focused.cu -o dpi_occupancy_focused
-nvcc -O3 -arch=sm_90 dpi_occupancy_focused_variant.cu -o dpi_occupancy_focused_variant
-nvcc -O3 -arch=sm_90 dpi_regex_matching.cu -o dpi_regex_matching
+make            # build everything
+make app1       # the network resilience system only
+make app2       # the deep packet inspection system only
+make check      # build App1 and run its four kernel variants
+make clean
 ```
 
-Builds that link against NVML and pthreads:
+`ARCH` selects the target architecture and defaults to `sm_90`, so `make ARCH=sm_80` builds for an
+A100. Each file is also self-contained and can be compiled directly:
 
 ```bash
-nvcc -O3 -arch=sm_90 dpi_memory_focused.cu        -lnvidia-ml -lpthread -o dpi_memory_focused
-nvcc -O3 -arch=sm_90 dpi_memory_focused_energy.cu -lnvidia-ml -lpthread -o dpi_memory_focused_energy
-nvcc -O3 -arch=sm_90 floyd_warshall_routing.cu    -lnvidia-ml -lpthread -o floyd_warshall_routing
+nvcc -O3 -arch=sm_90 App2/dpi_occupancy_focused.cu         -o App2/dpi_occupancy_focused
+nvcc -O3 -arch=sm_90 App2/dpi_occupancy_focused_variant.cu -o App2/dpi_occupancy_focused_variant
+nvcc -O3 -arch=sm_90 App2/dpi_regex_matching.cu            -o App2/dpi_regex_matching
+nvcc -O3 -arch=sm_90 App2/dpi_memory_focused.cu        -lnvidia-ml -lpthread -o App2/dpi_memory_focused
+nvcc -O3 -arch=sm_90 App2/dpi_memory_focused_energy.cu -lnvidia-ml -lpthread -o App2/dpi_memory_focused_energy
+nvcc -O3 -arch=sm_90 App1/floyd_warshall_routing.cu    -lnvidia-ml -lpthread -o App1/floyd_warshall_routing
 ```
 
 The results in the paper were produced on an **NVIDIA H100** (`-arch=sm_90`). Replace the flag with the architecture of your GPU if needed (e.g. `sm_70` for V100, `sm_80` for A100, `sm_86` for RTX 30xx, `sm_89` for RTX 40xx).
@@ -110,15 +118,15 @@ Relevant compile-time parameters (top of each DPI file):
 `dpi_occupancy_focused_variant` take no command-line options:
 
 ```bash
-./dpi_memory_focused
-./dpi_occupancy_focused
+./App2/dpi_memory_focused
+./App2/dpi_occupancy_focused
 ```
 
 `dpi_regex_matching` overrides its constants from the command line, and prints the configuration
 it used on the first line of output:
 
 ```bash
-./dpi_regex_matching --p_size 512 --s_count 10000 --s_len 16 --m_idx 1356 --block 32 1 1 --grid 313 1 1 --verbose
+./App2/dpi_regex_matching --p_size 512 --s_count 10000 --s_len 16 --m_idx 1356 --block 32 1 1 --grid 313 1 1 --verbose
 ```
 
 | Option | Meaning |
@@ -142,7 +150,7 @@ The routing program takes every parameter on the command line, so a sweep needs 
 rebuilds:
 
 ```bash
-./floyd_warshall_routing --nodes 24000 --layout coalesced --dpx on --trials 10 --warmup 1 --energy --csv results.csv
+./App1/floyd_warshall_routing --nodes 24000 --layout coalesced --dpx on --trials 10 --warmup 1 --energy --csv results.csv
 ```
 
 | Option | Meaning |
