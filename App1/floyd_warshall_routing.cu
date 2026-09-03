@@ -686,11 +686,12 @@ int main(int argc, char **argv)
             } else {
                 fseek(f, 0, SEEK_END);
                 if (ftell(f) == 0)
-                    fprintf(f, "nodes,target,layout,dpx,store,sync,block_threads,"
+                    fprintf(f, "nodes,target,gpu,layout,dpx,store,sync,block_threads,"
                                "grid_blocks,trial,kernel_s,endtoend_s,energy_j,"
                                "mean_power_w,power_samples,mismatches\n");
-                fprintf(f, "%d,%s,%s,%s,%s,%s,%d,%d,%d,%.6f,%.6f,",
+                fprintf(f, "%d,%s,%s,%s,%s,%s,%s,%d,%d,%d,%.6f,%.6f,",
                         V, run_cpu ? "cpu" : "gpu",
+                        run_cpu ? "n/a" : prop.name,
                         run_cpu ? "n/a" : (coalesced ? "coalesced" : "strided"),
                         run_cpu ? "n/a" : (use_dpx ? "on" : "off"),
                         run_cpu ? "n/a" : (store_changed ? "changed" : "always"),

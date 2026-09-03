@@ -54,23 +54,33 @@ next to its source:
 make            # build everything
 make app1       # the network resilience system only
 make app2       # the deep packet inspection system only
-make check      # build App1 and run its four kernel variants
-make clean
+make check      # build App1 and run its eight kernel variants
+make clean      # remove the binaries, every tag
 ```
 
-By default the Makefile builds one binary carrying native code for both `sm_80` and `sm_90`, so the
-same build runs on an A100 and on an H100 or H200 without recompiling. Building for a single
-architecture and running on the other still works, because the driver compiles the embedded PTX, but
-it no longer measures the same machine code. Override with `make ARCHES=90` when that is what you
-want. Each file is also self-contained and can be compiled directly:
+Every binary name ends in a tag, so builds for different GPUs can sit side by side on one shared
+file system and both machines can be measured at the same time without overwriting each other. The
+tag defaults to the architectures that were built, and `TAG` overrides it with a name of your own:
 
 ```bash
-nvcc -O3 -arch=sm_90 App2/dpi_occupancy_focused.cu         -o App2/dpi_occupancy_focused
-nvcc -O3 -arch=sm_90 App2/dpi_occupancy_focused_variant.cu -o App2/dpi_occupancy_focused_variant
-nvcc -O3 -arch=sm_90 App2/dpi_regex_matching.cu            -o App2/dpi_regex_matching
-nvcc -O3 -arch=sm_90 App2/dpi_memory_focused.cu        -lnvidia-ml -lpthread -o App2/dpi_memory_focused
-nvcc -O3 -arch=sm_90 App2/dpi_memory_focused_energy.cu -lnvidia-ml -lpthread -o App2/dpi_memory_focused_energy
-nvcc -O3 -arch=sm_90 App1/floyd_warshall_routing.cu    -lnvidia-ml -lpthread -o App1/floyd_warshall_routing
+make ARCHES=80 TAG=a100     # -> App1/floyd_warshall_routing-a100
+make ARCHES=90 TAG=h200     # -> App1/floyd_warshall_routing-h200
+```
+
+With no `ARCHES` the Makefile builds one binary carrying native code for both `sm_80` and `sm_90`,
+named `floyd_warshall_routing-sm80-sm90`, which runs on an A100 and on an H100 or H200 without
+recompiling. Building for a single architecture and running on the other still works, because the
+driver compiles the embedded PTX, but it no longer measures the same machine code. Each file is also
+self-contained and can be compiled directly:
+
+```bash
+TAG=h200   # or a100, so the two machines do not overwrite each other
+nvcc -O3 -arch=sm_90 App2/dpi_occupancy_focused.cu         -o App2/dpi_occupancy_focused-$TAG
+nvcc -O3 -arch=sm_90 App2/dpi_occupancy_focused_variant.cu -o App2/dpi_occupancy_focused_variant-$TAG
+nvcc -O3 -arch=sm_90 App2/dpi_regex_matching.cu            -o App2/dpi_regex_matching-$TAG
+nvcc -O3 -arch=sm_90 App2/dpi_memory_focused.cu        -lnvidia-ml -lpthread -o App2/dpi_memory_focused-$TAG
+nvcc -O3 -arch=sm_90 App2/dpi_memory_focused_energy.cu -lnvidia-ml -lpthread -o App2/dpi_memory_focused_energy-$TAG
+nvcc -O3 -arch=sm_90 App1/floyd_warshall_routing.cu    -lnvidia-ml -lpthread -o App1/floyd_warshall_routing-$TAG
 ```
 
 The results in the paper were produced on an **NVIDIA H100** (`-arch=sm_90`). Replace the flag with the architecture of your GPU if needed (e.g. `sm_70` for V100, `sm_80` for A100, `sm_86` for RTX 30xx, `sm_89` for RTX 40xx).
@@ -121,15 +131,15 @@ Relevant compile-time parameters (top of each DPI file):
 `dpi_occupancy_focused_variant` take no command-line options:
 
 ```bash
-./App2/dpi_memory_focused
-./App2/dpi_occupancy_focused
+./App2/dpi_memory_focused-h200
+./App2/dpi_occupancy_focused-h200
 ```
 
 `dpi_regex_matching` overrides its constants from the command line, and prints the configuration
 it used on the first line of output:
 
 ```bash
-./App2/dpi_regex_matching --p_size 512 --s_count 10000 --s_len 16 --m_idx 1356 --block 32 1 1 --grid 313 1 1 --verbose
+./App2/dpi_regex_matching-h200 --p_size 512 --s_count 10000 --s_len 16 --m_idx 1356 --block 32 1 1 --grid 313 1 1 --verbose
 ```
 
 | Option | Meaning |
@@ -153,8 +163,12 @@ The routing program takes every parameter on the command line, so a sweep needs 
 rebuilds:
 
 ```bash
-./App1/floyd_warshall_routing --nodes 24000 --layout coalesced --dpx on --trials 10 --warmup 1 --energy --csv results.csv
+./App1/floyd_warshall_routing-h200 --nodes 24000 --layout coalesced --dpx on --trials 10 --warmup 1 --energy --csv results_h200.csv
 ```
+
+Give each machine its own `--csv` file. Two runs appending to one file on a shared file system
+interleave their rows and can tear a line. Every row records the GPU it came from in the `gpu`
+column, so a merge afterwards is safe and an accidental mixture is still readable.
 
 | Option | Meaning |
 |--------|---------|
