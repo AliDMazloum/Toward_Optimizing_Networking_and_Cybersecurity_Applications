@@ -160,7 +160,8 @@ rebuilds:
 |--------|---------|
 | `--nodes <int>` | Number of vertices. Default 12000. |
 | `--layout <name>` | `coalesced`, in which a block strides over rows and a thread over columns, or `strided`, the non-coalesced mapping in which consecutive threads address entries `nodes` apart. Default `coalesced`. |
-| `--dpx <state>` | `on` uses `__viaddmin_s32`; `off` computes the same value with an add and a minimum, which is the DPX-off arm on the same GPU. Default `on`. |
+| `--dpx <state>` | `on` uses a DPX instruction; `off` computes the same value with an ordinary add and minimum, which is the DPX-off arm on the same GPU. Default `on`. |
+| `--store <policy>` | `always` writes every cell on every pass. `changed` writes only the cells whose value improves, which removes most of the write traffic and is what the originally published kernel did. With `--dpx on` the two policies use different instructions, `__viaddmin_s32` and `__vibmin_s32` respectively, because only the second returns the comparison alongside the minimum. Default `always`. |
 | `--trials <int>` | Measured repetitions. Default 1. |
 | `--warmup <int>` | Unmeasured repetitions run first. Default 1. |
 | `--cpu` | Run the serial host reference instead of the GPU. |

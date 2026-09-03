@@ -65,20 +65,30 @@ app1: $(APP1_TARGETS)
 
 app2: $(APP2_TARGETS)
 
-$(NVML_TARGETS): %: %.cu
+# Every binary depends on this file as well as on its source, so a change to
+# ARCHES or to any other flag forces a rebuild. Without that, a binary built for
+# one GPU is silently reused on another and fails with "no kernel image is
+# available for execution on the device".
+$(NVML_TARGETS): %: %.cu Makefile
 	$(NVCC) $(NVCCFLAGS) $< $(NVML_LIBS) -o $@
 
-$(PLAIN_TARGETS): %: %.cu
+$(PLAIN_TARGETS): %: %.cu Makefile
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
-# Runs each of the four routing kernel variants once. The last field of every
-# trial line is the number of matrix entries that disagree with the closed-form
-# answer, and it must be 0 in all four runs.
+# Runs all eight routing kernel variants once and prints one line each. The last
+# field is the number of matrix entries that disagree with the closed-form
+# answer, and it must be 0 on every line.
 check: $(APP1_TARGETS)
-	./$(APP1)/floyd_warshall_routing --nodes $(CHECK_NODES) --trials 1 --warmup 0 --layout coalesced --dpx on
-	./$(APP1)/floyd_warshall_routing --nodes $(CHECK_NODES) --trials 1 --warmup 0 --layout coalesced --dpx off
-	./$(APP1)/floyd_warshall_routing --nodes $(CHECK_NODES) --trials 1 --warmup 0 --layout strided --dpx on
-	./$(APP1)/floyd_warshall_routing --nodes $(CHECK_NODES) --trials 1 --warmup 0 --layout strided --dpx off
+	@for l in coalesced strided; do \
+	  for d in on off; do \
+	    for s in always changed; do \
+	      printf '%-10s dpx=%-3s store=%-7s ' "$$l" "$$d" "$$s"; \
+	      ./$(APP1)/floyd_warshall_routing --nodes $(CHECK_NODES) --trials 1 \
+	        --warmup 0 --layout $$l --dpx $$d --store $$s \
+	        | grep -v '^#' | tail -1; \
+	    done; \
+	  done; \
+	done
 
 clean:
 	rm -f $(TARGETS)

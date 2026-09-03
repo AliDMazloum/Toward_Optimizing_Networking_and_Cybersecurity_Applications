@@ -9,6 +9,7 @@
 //
 //   --layout coalesced | strided   thread to data mapping
 //   --dpx    on | off              DPX instruction, or its plain equivalent
+//   --store  always | changed      write every cell, or only the improvements
 //
 // Every run repeats the whole computation --trials times and reports two
 // timings per trial:
@@ -227,26 +228,46 @@ static void power_dump_csv(const char *path)
 //
 //     D[i][j] = min(D[i][k] + D[k][j], D[i][j])
 //
-// USE_DPX picks how that is expressed. __viaddmin_s32 is the DPX instruction and
-// needs compute capability 9.0 to run in hardware. The plain form computes the
-// same value with an add and a minimum, and is the "DPX off" arm of the
-// comparison on the same chip.
+// Two template parameters select the four ways of expressing it.
+//
+// USE_DPX picks whether a DPX instruction is used. DPX needs compute capability
+// 9.0 to run in hardware, so the off arm is the same computation on the same
+// chip without it.
+//
+// STORE_CHANGED picks whether every cell is written or only the cells whose
+// value improves. Skipping the rest removes most of the write traffic, and it
+// is where the DPX predicate form earns its keep, because __vibmin_s32 returns
+// the comparison alongside the minimum. NVIDIA defines it as min(a, b) with the
+// predicate set to (a <= b), so the predicate is true exactly when the new
+// candidate wins.
 // ---------------------------------------------------------------------------
 
-template <bool USE_DPX>
-__device__ __forceinline__ int relax(int a, int b, int c)
+template <bool USE_DPX, bool STORE_CHANGED>
+__device__ __forceinline__ void relax_cell(int a, int b, int *cell)
 {
-    if (USE_DPX) {
-        return __viaddmin_s32(a, b, c);
+    const int c = *cell;
+    if (STORE_CHANGED) {
+        if (USE_DPX) {
+            bool improved;
+            const int r = __vibmin_s32(a + b, c, &improved);
+            if (improved) *cell = r;
+        } else {
+            const int t = a + b;
+            if (t < c) *cell = t;
+        }
     } else {
-        int t = a + b;
-        return t < c ? t : c;
+        if (USE_DPX) {
+            *cell = __viaddmin_s32(a, b, c);
+        } else {
+            const int t = a + b;
+            *cell = t < c ? t : c;
+        }
     }
 }
 
 // Coalesced mapping: a block strides over the rows, a thread strides over the
 // columns. Threads of a warp therefore address adjacent entries of a row.
-template <bool USE_DPX>
+template <bool USE_DPX, bool STORE_CHANGED>
 __global__ void fw_coalesced(int V, int k, int *dis)
 {
     for (int i = blockIdx.x; i < V; i += gridDim.x) {
@@ -254,7 +275,7 @@ __global__ void fw_coalesced(int V, int k, int *dis)
         const int d_ik = dis[row + k];
         const long long krow = (long long)k * V;
         for (int j = threadIdx.x; j < V; j += blockDim.x) {
-            dis[row + j] = relax<USE_DPX>(d_ik, dis[krow + j], dis[row + j]);
+            relax_cell<USE_DPX, STORE_CHANGED>(d_ik, dis[krow + j], &dis[row + j]);
         }
     }
 }
@@ -262,7 +283,7 @@ __global__ void fw_coalesced(int V, int k, int *dis)
 // Strided mapping: one flat loop over the |V|^2 entries in which the row index
 // varies fastest, so consecutive threads address entries |V| apart. This is the
 // non-coalesced arm of the memory access experiment.
-template <bool USE_DPX>
+template <bool USE_DPX, bool STORE_CHANGED>
 __global__ void fw_strided(int V, int k, int *dis)
 {
     const long long n = (long long)V * V;
@@ -273,9 +294,9 @@ __global__ void fw_strided(int V, int k, int *dis)
         const int row = (int)(idx % V);
         const int col = (int)(idx / V);
         const long long cell = (long long)row * V + col;
-        dis[cell] = relax<USE_DPX>(dis[(long long)row * V + k],
-                                   dis[(long long)k * V + col],
-                                   dis[cell]);
+        relax_cell<USE_DPX, STORE_CHANGED>(dis[(long long)row * V + k],
+                                           dis[(long long)k * V + col],
+                                           &dis[cell]);
     }
 }
 
@@ -340,6 +361,43 @@ static long long count_mismatches(int V, const int *dis)
 // occupancy query and for dispatch.
 typedef void (*FwKernel)(int, int, int *);
 
+// The occupancy query needs the instantiation that will actually run.
+static FwKernel select_kernel(bool coalesced, bool use_dpx, bool store_changed)
+{
+    if (coalesced) {
+        if (use_dpx)
+            return store_changed ? fw_coalesced<true, true> : fw_coalesced<true, false>;
+        return store_changed ? fw_coalesced<false, true> : fw_coalesced<false, false>;
+    }
+    if (use_dpx)
+        return store_changed ? fw_strided<true, true> : fw_strided<true, false>;
+    return store_changed ? fw_strided<false, true> : fw_strided<false, false>;
+}
+
+// A launch cannot go through a function pointer, so the same choice is spelled
+// out once here rather than at every call site.
+static void launch_relaxation(bool coalesced, bool use_dpx, bool store_changed,
+                              int grid, int V, int k, int *dis_d)
+{
+    if (coalesced) {
+        if (use_dpx) {
+            if (store_changed) fw_coalesced<true, true><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
+            else               fw_coalesced<true, false><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
+        } else {
+            if (store_changed) fw_coalesced<false, true><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
+            else               fw_coalesced<false, false><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
+        }
+    } else {
+        if (use_dpx) {
+            if (store_changed) fw_strided<true, true><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
+            else               fw_strided<true, false><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
+        } else {
+            if (store_changed) fw_strided<false, true><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
+            else               fw_strided<false, false><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
+        }
+    }
+}
+
 static int derive_grid(FwKernel kernel, int V, bool strided_layout,
                        int *blocks_per_sm_out, int *sm_count_out)
 {
@@ -399,6 +457,8 @@ static void print_usage(const char *prog)
     printf("  --nodes <int>       number of vertices (default 12000)\n");
     printf("  --layout <name>     coalesced | strided (default coalesced)\n");
     printf("  --dpx <state>       on | off (default on)\n");
+    printf("  --store <policy>    always | changed: write every cell, or only\n");
+    printf("                      the cells whose value improves (default always)\n");
     printf("  --trials <int>      measured repetitions (default 1)\n");
     printf("  --warmup <int>      unmeasured repetitions first (default 1)\n");
     printf("  --sync <state>      per-launch | none: host synchronization after\n");
@@ -426,6 +486,7 @@ int main(int argc, char **argv)
     int   device      = 0;
     bool  verify      = true;
     bool  sync_each   = true;
+    bool  store_changed = false;
     const char *csv_path = NULL;
     const char *power_csv_path = NULL;
 
@@ -449,6 +510,11 @@ int main(int argc, char **argv)
             trials = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--warmup") && i + 1 < argc) {
             warmup = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--store") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "always"))       store_changed = false;
+            else if (!strcmp(v, "changed")) store_changed = true;
+            else { fprintf(stderr, "Unknown store policy: %s\n", v); return 1; }
         } else if (!strcmp(argv[i], "--sync") && i + 1 < argc) {
             const char *v = argv[++i];
             if (!strcmp(v, "per-launch"))  sync_each = true;
@@ -495,9 +561,7 @@ int main(int argc, char **argv)
         CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
         CUDA_CHECK(cudaMalloc((void **)&dis_d, bytes));
 
-        FwKernel kernel;
-        if (coalesced) kernel = use_dpx ? fw_coalesced<true> : fw_coalesced<false>;
-        else           kernel = use_dpx ? fw_strided<true>   : fw_strided<false>;
+        FwKernel kernel = select_kernel(coalesced, use_dpx, store_changed);
         grid = derive_grid(kernel, V, !coalesced, &blocks_per_sm, &sm_count);
     }
 
@@ -511,6 +575,8 @@ int main(int argc, char **argv)
         printf("# compute_capability: %d.%d\n", prop.major, prop.minor);
         printf("# layout            : %s\n", coalesced ? "coalesced" : "strided");
         printf("# dpx               : %s\n", use_dpx ? "on" : "off");
+        printf("# store             : %s\n",
+               store_changed ? "only cells that improve" : "every cell");
         printf("# block_threads     : %d\n", BLOCK_THREADS);
         printf("# grid_blocks       : %d (min of work and %d SMs x %d resident blocks)\n",
                grid, sm_count, blocks_per_sm);
@@ -573,13 +639,8 @@ int main(int argc, char **argv)
 
             CUDA_CHECK(cudaEventRecord(ev_start, 0));
             for (int k = 0; k < V; k++) {
-                if (coalesced) {
-                    if (use_dpx) fw_coalesced<true><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
-                    else         fw_coalesced<false><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
-                } else {
-                    if (use_dpx) fw_strided<true><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
-                    else         fw_strided<false><<<grid, BLOCK_THREADS>>>(V, k, dis_d);
-                }
+                launch_relaxation(coalesced, use_dpx, store_changed,
+                                  grid, V, k, dis_d);
                 // Launches on one stream already run in order, so the
                 // synchronization is not needed for correctness. It is the
                 // default because it is what the originally reported
@@ -625,13 +686,14 @@ int main(int argc, char **argv)
             } else {
                 fseek(f, 0, SEEK_END);
                 if (ftell(f) == 0)
-                    fprintf(f, "nodes,target,layout,dpx,sync,block_threads,"
+                    fprintf(f, "nodes,target,layout,dpx,store,sync,block_threads,"
                                "grid_blocks,trial,kernel_s,endtoend_s,energy_j,"
                                "mean_power_w,power_samples,mismatches\n");
-                fprintf(f, "%d,%s,%s,%s,%s,%d,%d,%d,%.6f,%.6f,",
+                fprintf(f, "%d,%s,%s,%s,%s,%s,%d,%d,%d,%.6f,%.6f,",
                         V, run_cpu ? "cpu" : "gpu",
                         run_cpu ? "n/a" : (coalesced ? "coalesced" : "strided"),
                         run_cpu ? "n/a" : (use_dpx ? "on" : "off"),
+                        run_cpu ? "n/a" : (store_changed ? "changed" : "always"),
                         run_cpu ? "n/a" : (sync_each ? "per-launch" : "none"),
                         run_cpu ? 0 : BLOCK_THREADS, run_cpu ? 0 : grid,
                         t + 1, kernel_s[t], endtoend_s[t]);
