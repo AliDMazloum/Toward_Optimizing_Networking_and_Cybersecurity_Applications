@@ -51,6 +51,13 @@ GENCODE   := $(foreach a,$(ARCHES),-gencode arch=compute_$(a),code=sm_$(a))
 NVCCFLAGS ?= -O3 $(GENCODE)
 NVML_LIBS ?= -lnvidia-ml -lpthread
 
+# Host-compiler flags, passed through nvcc to gcc. OpenMP spreads the --cpu
+# paths across cores, and -march=native lets gcc vectorize them for the
+# machine doing the build, so build on the node that runs, or the binary can
+# trap on an instruction the run node lacks. Set HOSTFLAGS= for a serial,
+# generic host build.
+HOSTFLAGS ?= -Xcompiler -fopenmp,-march=native
+
 # Name tag appended to every binary. Two machines that share a file system would
 # otherwise overwrite each other's binaries, and a build for the wrong GPU fails
 # at run time with "no kernel image is available for execution on the device".
@@ -116,7 +123,7 @@ app2: $(APP2_TARGETS)
 # one GPU is silently reused on another and fails with "no kernel image is
 # available for execution on the device".
 $(TARGETS): %-$(TAG): %.cu Makefile
-	$(NVCC) $(NVCCFLAGS) $< $(NVML_LIBS) -o $@
+	$(NVCC) $(NVCCFLAGS) $(HOSTFLAGS) $< $(NVML_LIBS) -o $@
 
 # Runs the twelve routing kernel variants and the eight DPI kernel variants
 # once each and prints one line per variant. The last field of every line is a
@@ -257,6 +264,7 @@ help:
 	@echo "  ARCHES      = $(ARCHES)   (80 is the A100, 90 the H100 and H200)"
 	@echo "  TAG         = $(TAG)"
 	@echo "  NVCCFLAGS   = $(NVCCFLAGS)"
+	@echo "  HOSTFLAGS   = $(HOSTFLAGS)"
 	@echo "  NVML_LIBS   = $(NVML_LIBS)"
 	@echo "  CHECK_NODES = $(CHECK_NODES)"
 	@echo "  SWEEP_NODES = $(SWEEP_NODES)"

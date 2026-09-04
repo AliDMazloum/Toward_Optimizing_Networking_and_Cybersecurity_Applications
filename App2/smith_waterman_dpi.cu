@@ -59,6 +59,10 @@
 #include <nvml.h>
 #include <cuda_runtime.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 // ---------------------------------------------------------------------------
 // Fixed parameters
 //
@@ -538,6 +542,19 @@ static bool host_scan_signature(bool regex_mode, const char *payload, int P,
     return false;
 }
 
+// Names how the host path runs, for the header and the csv: the OpenMP
+// thread count when the build enables it, serial otherwise.
+static const char *cpu_desc(void)
+{
+#ifdef _OPENMP
+    static char buf[32];
+    snprintf(buf, sizeof buf, "openmp-%d", omp_get_max_threads());
+    return buf;
+#else
+    return "serial";
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // Problem set-up
 //
@@ -676,7 +693,8 @@ static void print_usage(const char *prog)
     printf("                      (default: none, nothing matches)\n");
     printf("  --trials <int>      measured repetitions (default 1)\n");
     printf("  --warmup <int>      unmeasured repetitions first (default 1)\n");
-    printf("  --cpu               run the serial host reference instead of the GPU\n");
+    printf("  --cpu               run the host reference instead of the GPU\n");
+    printf("                      (OpenMP when the build enables it, else serial)\n");
     printf("  --energy            sample GPU power with NVML and report energy\n");
     printf("  --poll-ms <int>     NVML sampling interval, ms (default 1)\n");
     printf("  --device <int>      CUDA and NVML device index (default 0)\n");
@@ -1000,7 +1018,9 @@ int main(int argc, char **argv)
     printf("# cell_updates      : %.0f per trial (payload bytes 1..%d;"
            " byte 0 is never scored)\n",
            (double)N * (double)(P - 1) * (double)L, P - 1);
-    printf("# target            : %s\n", run_cpu ? "cpu (serial reference)" : "gpu");
+    printf("# target            : %s\n", run_cpu ? "cpu" : "gpu");
+    if (run_cpu)
+        printf("# cpu_run           : %s\n", cpu_desc());
     if (!run_cpu) {
         printf("# gpu               : %s\n", prop.name);
         printf("# compute_capability: %d.%d\n", prop.major, prop.minor);
@@ -1039,9 +1059,9 @@ int main(int argc, char **argv)
         printf("# host_crossers     : %lld of %lld signatures cross\n",
                host_crossers, N);
     printf("# kernel_window     : the %s only\n",
-           run_cpu ? "serial scan" : "kernel launch");
+           run_cpu ? "host scan" : "kernel launch");
     if (run_cpu)
-        printf("# endtoend_window   : the serial scan\n");
+        printf("# endtoend_window   : the host scan\n");
     else
         printf("# endtoend_window   : payload upload, the kernel launch,"
                " report copy back\n");
@@ -1092,19 +1112,30 @@ int main(int argc, char **argv)
         double t0 = 0.0, t1 = 0.0, kernel_seconds = 0.0;
 
         if (run_cpu) {
+            // The signatures are independent, so the loop is spread across
+            // OpenMP threads when the build enables it; without OpenMP the
+            // pragma is ignored and the loop runs serially. The first
+            // crossing to reach the critical section claims the report, as
+            // the kernel's atomic compare-and-swap does, so which signature
+            // claims may differ between runs, and the claimed signature
+            // must still reproduce exactly under the verifier below.
+            volatile bool stop = false;
             t0 = now_seconds();
+            #pragma omp parallel for schedule(static)
             for (long long k = 0; k < N; k++) {
+                if (stop) continue;
                 int sc, po, be;
                 if (host_scan_signature(regex_mode, payload, P,
                                         signatures + (size_t)k * slot, L,
                                         THR_OF(k), &sc, &po, &be)) {
+                    #pragma omp critical
                     if (rep.claimed == 0) {
                         rep.claimed = 1;
                         rep.score = sc;
                         rep.sig = (int)k;
                         rep.pos = po;
                     }
-                    if (exit_first) break;
+                    if (exit_first) stop = true;
                 }
             }
             t1 = now_seconds();
@@ -1197,7 +1228,7 @@ int main(int argc, char **argv)
                         alpha, run_cpu ? 0 : block, run_cpu ? 0 : grid,
                         exit_first ? "first" : "never", plant, seed,
                         run_cpu ? "cpu" : "gpu",
-                        run_cpu ? "n/a" : prop.name,
+                        run_cpu ? cpu_desc() : prop.name,
                         t + 1, kernel_s[t], endtoend_s[t]);
                 if (measure_energy && !run_cpu && energy_ok[t])
                     fprintf(f, "%.3f,%.3f,%d,", energy_j[t], power_w[t], nsamp);

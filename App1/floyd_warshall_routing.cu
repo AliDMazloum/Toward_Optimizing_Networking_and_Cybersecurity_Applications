@@ -37,6 +37,10 @@
 #include <nvml.h>
 #include <cuda_runtime.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 // ---------------------------------------------------------------------------
 // Fixed parameters
 // ---------------------------------------------------------------------------
@@ -442,21 +446,39 @@ __global__ void fw_tiled_rest(int Vp, int r, int *dis)
     }
 }
 
-// Serial reference on the host, used to check the GPU result and as the CPU
-// baseline. It is the textbook triple loop.
+// Host reference, used to check the GPU result and as the CPU baseline: the
+// textbook triple loop. The k loop carries the recurrence and stays ordered.
+// The rows of one k step are independent, because row k itself cannot change
+// during step k (its candidate update adds dis[k][k], which is 0), so they
+// are spread across OpenMP threads when the build enables it; without
+// OpenMP the pragma is ignored and the loop runs serially.
 static void fw_cpu(int V, int *dis)
 {
     for (int k = 0; k < V; k++) {
+        const long long krow = (long long)k * V;
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < V; i++) {
             const long long row = (long long)i * V;
             const int d_ik = dis[row + k];
-            const long long krow = (long long)k * V;
             for (int j = 0; j < V; j++) {
                 const int t = d_ik + dis[krow + j];
                 if (t < dis[row + j]) dis[row + j] = t;
             }
         }
     }
+}
+
+// Names how the host path runs, for the header and the csv: the OpenMP
+// thread count when the build enables it, serial otherwise.
+static const char *cpu_desc(void)
+{
+#ifdef _OPENMP
+    static char buf[32];
+    snprintf(buf, sizeof buf, "openmp-%d", omp_get_max_threads());
+    return buf;
+#else
+    return "serial";
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -657,7 +679,8 @@ static void print_usage(const char *prog)
     printf("  --warmup <int>      unmeasured repetitions first (default 1)\n");
     printf("  --sync <state>      per-launch | none: host synchronization after\n");
     printf("                      each launch (default per-launch)\n");
-    printf("  --cpu               run the serial host reference instead of the GPU\n");
+    printf("  --cpu               run the host reference instead of the GPU\n");
+    printf("                      (OpenMP when the build enables it, else serial)\n");
     printf("  --energy            sample GPU power with NVML and report energy\n");
     printf("  --poll-ms <int>     NVML sampling interval, ms (default 1)\n");
     printf("  --device <int>      CUDA and NVML device index (default 0)\n");
@@ -793,7 +816,9 @@ int main(int argc, char **argv)
     printf("# program           : floyd_warshall_routing\n");
     printf("# nodes             : %d\n", V);
     printf("# matrix_bytes      : %zu\n", bytes);
-    printf("# target            : %s\n", run_cpu ? "cpu (serial reference)" : "gpu");
+    printf("# target            : %s\n", run_cpu ? "cpu" : "gpu");
+    if (run_cpu)
+        printf("# cpu_run           : %s\n", cpu_desc());
     if (!run_cpu) {
         printf("# gpu               : %s\n", prop.name);
         printf("# compute_capability: %d.%d\n", prop.major, prop.minor);
@@ -821,9 +846,9 @@ int main(int argc, char **argv)
     printf("# warmup            : %d (not reported)\n", warmup);
     printf("# verify            : %s\n", verify ? "on" : "off");
     printf("# kernel_window     : the %s only\n",
-           run_cpu ? "serial triple loop" : "kernel launches");
+           run_cpu ? "triple loop" : "kernel launches");
     if (run_cpu)
-        printf("# endtoend_window   : the serial triple loop\n");
+        printf("# endtoend_window   : the triple loop\n");
     else
         printf("# endtoend_window   : host to device copy, the kernel launches,"
                " device to host copy\n");
@@ -932,7 +957,7 @@ int main(int argc, char **argv)
                                "mean_power_w,power_samples,mismatches\n");
                 fprintf(f, "%d,%s,%s,%s,%s,%s,%s,%d,%d,%d,%.6f,%.6f,",
                         V, run_cpu ? "cpu" : "gpu",
-                        run_cpu ? "n/a" : prop.name,
+                        run_cpu ? cpu_desc() : prop.name,
                         run_cpu ? "n/a" : layout_name(layout),
                         run_cpu ? "n/a" : (use_dpx ? "on" : "off"),
                         run_cpu ? "n/a" : (store_changed ? "changed" : "always"),
