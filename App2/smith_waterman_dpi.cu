@@ -284,11 +284,15 @@ static void power_dump_csv(const char *path)
 //   base    = max(H[i-1][j], H[i-1][j-1], H[i][j-1], 0)
 //   H[i][j] = base + score(base, p[i-1], s[j-1])
 //
-// The score steps below are transliterated from the measured programs
-// (DPI_v7.2.cu and DPI_regex_v4.cu, kept under Old_files/), same constants,
-// same guards, same branch-free arithmetic. Three behaviours of those
-// programs are also reproduced exactly because changing them would change
-// what is computed:
+// The score steps below compute exactly what the measured programs computed
+// (DPI_v7.2.cu and DPI_regex_v4.cu, kept under Old_files/): same constants,
+// same guards, same results for every input. They are written as conditional
+// selections rather than the originals' chains of boolean multiplications,
+// because the compiler turns selections into cheap predicated instructions
+// while the multiply chains cost 2 to 3 times the kernel time in the --dpx
+// off arm; the host verifier confirms the two forms agree. Three behaviours
+// of those programs are also reproduced exactly because changing them would
+// change what is computed:
 //
 //   - scanning starts at the second payload character; the measured kernels
 //     initialize the first DP row into dead storage, so payload byte 0 never
@@ -310,29 +314,30 @@ __host__ __device__ __forceinline__ bool is_ascii_digit(char c)
 
 __host__ __device__ __forceinline__ int step_literal(int base, char p, char s)
 {
-    const bool a = (p == s);
-    return base + LIT_MATCH * a + LIT_MISMATCH * (!a) * (base > 1);
+    if (p == s) return base + LIT_MATCH;
+    return base > 1 ? base + LIT_MISMATCH : base;
 }
 
 // Regex scoring: '*' contributes 0 and suppresses the gap penalty, '.' matches
 // any one character contributing 0 (the gap penalty still applies, which is
 // one of the asymmetries reviewer 1 comment 7 asks about), and '~' matches any
 // one digit contributing 0. All three carried over unchanged from the measured
-// kernel, in its own condition encoding: c1 = not '*', c2 = not '.', c3 = not
-// '~', c4 = characters equal.
+// kernel.
 __host__ __device__ __forceinline__ int step_regex(int base, char p, char s,
                                                    bool p_is_digit)
 {
-    const bool c1 = (s != '*');
-    const bool c2 = (s != '.');
-    const bool c3 = (s != '~');
-    const bool c4 = (p == s);
-    const bool c5 = !c4;
+    const bool star  = (s == '*');
+    const bool any1  = (s == '.');
+    const bool digit = (s == '~');
 
-    return base
-         + (base > 3) * c5 * c1 * RE_INDEL
-         + c1 * c2 * c3 * (c4 * RE_MATCH + (base > 4) * c5 * RE_MISMATCH)
-         + (base > 4) * (!c3) * RE_MISMATCH * (!p_is_digit);
+    int t = base;
+    if (base > 3 && p != s && !star) t += RE_INDEL;
+    if (!star && !any1 && !digit) {
+        if (p == s)        t += RE_MATCH;
+        else if (base > 4) t += RE_MISMATCH;
+    }
+    if (digit && base > 4 && !p_is_digit) t += RE_MISMATCH;
+    return t;
 }
 
 __host__ __device__ __forceinline__ int max3_relu(int a, int b, int c)
@@ -342,25 +347,20 @@ __host__ __device__ __forceinline__ int max3_relu(int a, int b, int c)
     return m > 0 ? m : 0;
 }
 
-__device__ __forceinline__ uint32_t umax3(uint32_t a, uint32_t b, uint32_t c)
-{
-    uint32_t m = a > b ? a : b;
-    return c > m ? c : m;
-}
-
 // The packed base: max of three values and 0, per signed 16-bit halfword. The
 // DPX arm is one instruction on compute capability 9.0; the plain arm is what
-// --dpx off measures on the same chip. Every halfword the kernel ever stores
-// is non-negative (the guards in the score steps never drive a cell below
-// zero), so the signed max-with-relu reduces to an unsigned max per halfword,
-// with no sign extension.
+// --dpx off measures on the same chip.
 template <bool USE_DPX>
 __device__ __forceinline__ uint32_t base_packed(uint32_t n, uint32_t nw, uint32_t w)
 {
     if (USE_DPX) return __vimax3_s16x2_relu(n, nw, w);
-    const uint32_t lo = umax3(n & 0xFFFFu, nw & 0xFFFFu, w & 0xFFFFu);
-    const uint32_t hi = umax3(n >> 16, nw >> 16, w >> 16);
-    return lo | (hi << 16);
+    const int lo = max3_relu((int)(int16_t)(n  & 0xFFFFu),
+                             (int)(int16_t)(nw & 0xFFFFu),
+                             (int)(int16_t)(w  & 0xFFFFu));
+    const int hi = max3_relu((int)(int16_t)(n  >> 16),
+                             (int)(int16_t)(nw >> 16),
+                             (int)(int16_t)(w  >> 16));
+    return (uint32_t)(uint16_t)lo | ((uint32_t)(uint16_t)hi << 16);
 }
 
 // ---------------------------------------------------------------------------
@@ -489,10 +489,9 @@ __global__ void sw_scan(int midpoint, int payload_len,
                 w  = rows[cur  + (long long)(j - 1) * midpoint + gid];
             }
 
-            // No sign extension on unpack: every stored halfword is >= 0.
             const uint32_t base2 = base_packed<USE_DPX>(n, nw, w);
-            const int b0 = (int)(base2 & 0xFFFFu);
-            const int b1 = (int)(base2 >> 16);
+            const int b0 = (int)(int16_t)(base2 & 0xFFFFu);
+            const int b1 = (int)(int16_t)(base2 >> 16);
 
             const char s0 = ROWS_REG ? sig0[j - 1] : signatures[off0 + j - 1];
             const char s1 = ROWS_REG ? sig1[j - 1] : signatures[off1 + j - 1];
@@ -502,7 +501,8 @@ __global__ void sw_scan(int midpoint, int payload_len,
             const int t1 = REGEX ? step_regex(b1, p, s1, pdig)
                                  : step_literal(b1, p, s1);
 
-            const uint32_t packed = (uint32_t)t0 | ((uint32_t)t1 << 16);
+            const uint32_t packed =
+                (uint32_t)(uint16_t)t0 | ((uint32_t)(uint16_t)t1 << 16);
             if (ROWS_REG) {
                 if (even) rowB[j] = packed; else rowA[j] = packed;
             } else {
