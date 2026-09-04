@@ -446,6 +446,68 @@ __global__ void fw_tiled_rest(int Vp, int r, int *dis)
     }
 }
 
+// ---------------------------------------------------------------------------
+// RAPL energy for the host path
+//
+// The kernel's powercap interface counts package energy in microjoules at
+// /sys/class/powercap/intel-rapl:<n>/energy_uj (the name is historical; the
+// same driver serves AMD packages). A reading brackets exactly the code
+// between begin and end, so no sampling thread is involved. Each counter
+// wraps at its max_energy_range_uj; the reader unwraps per package and sums
+// the packages. Package energy covers everything on the socket, not just
+// this process. rapl_zones() returning 0 means the counters are absent or
+// not readable here.
+// ---------------------------------------------------------------------------
+
+#define RAPL_MAX_PKGS 8
+static int       g_rapl_pkgs = 0;
+static long long g_rapl_range[RAPL_MAX_PKGS];
+static long long g_rapl_before[RAPL_MAX_PKGS];
+
+static bool rapl_read_pkg(int i, const char *file, long long *out)
+{
+    char path[96];
+    snprintf(path, sizeof path, "/sys/class/powercap/intel-rapl:%d/%s", i, file);
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return false;
+    const bool ok = (fscanf(f, "%lld", out) == 1);
+    fclose(f);
+    return ok;
+}
+
+// Counts the readable packages once, caching each one's counter range.
+static int rapl_zones(void)
+{
+    long long v;
+    g_rapl_pkgs = 0;
+    while (g_rapl_pkgs < RAPL_MAX_PKGS &&
+           rapl_read_pkg(g_rapl_pkgs, "energy_uj", &v) &&
+           rapl_read_pkg(g_rapl_pkgs, "max_energy_range_uj",
+                         &g_rapl_range[g_rapl_pkgs]))
+        g_rapl_pkgs++;
+    return g_rapl_pkgs;
+}
+
+static void rapl_begin(void)
+{
+    for (int i = 0; i < g_rapl_pkgs; i++)
+        rapl_read_pkg(i, "energy_uj", &g_rapl_before[i]);
+}
+
+// Joules over all packages since rapl_begin, unwrapped per package.
+static double rapl_end_joules(void)
+{
+    long long total_uj = 0;
+    for (int i = 0; i < g_rapl_pkgs; i++) {
+        long long after = g_rapl_before[i];
+        rapl_read_pkg(i, "energy_uj", &after);
+        long long d = after - g_rapl_before[i];
+        if (d < 0) d += g_rapl_range[i];
+        total_uj += d;
+    }
+    return (double)total_uj / 1e6;
+}
+
 // Host reference, used to check the GPU result and as the CPU baseline: the
 // textbook triple loop. The k loop carries the recurrence and stays ordered.
 // The rows of one k step are independent, because row k itself cannot change
@@ -681,7 +743,8 @@ static void print_usage(const char *prog)
     printf("                      each launch (default per-launch)\n");
     printf("  --cpu               run the host reference instead of the GPU\n");
     printf("                      (OpenMP when the build enables it, else serial)\n");
-    printf("  --energy            sample GPU power with NVML and report energy\n");
+    printf("  --energy            report per-trial energy: NVML power sampling\n");
+    printf("                      on the GPU, RAPL package counters with --cpu\n");
     printf("  --poll-ms <int>     NVML sampling interval, ms (default 1)\n");
     printf("  --device <int>      CUDA and NVML device index (default 0)\n");
     printf("  --csv <path>        append one row per trial to this file\n");
@@ -860,6 +923,15 @@ int main(int argc, char **argv)
         struct timespec settle = { 0, 100 * 1000000L };
         nanosleep(&settle, NULL);
     }
+    if (measure_energy && run_cpu) {
+        if (rapl_zones() == 0) {
+            fprintf(stderr, "--cpu --energy needs readable RAPL counters at"
+                            " /sys/class/powercap/intel-rapl:*/energy_uj\n");
+            return 1;
+        }
+        printf("# energy_source     : rapl, %d package(s), read at the window"
+               " edges\n", g_rapl_pkgs);
+    }
 
     double *kernel_s   = (double *)calloc(trials, sizeof(double));
     double *endtoend_s = (double *)calloc(trials, sizeof(double));
@@ -874,7 +946,7 @@ int main(int argc, char **argv)
     }
 
     printf("trial,kernel_s,endtoend_s");
-    if (measure_energy && !run_cpu) printf(",energy_j,mean_power_w,power_samples");
+    if (measure_energy) printf(",energy_j,mean_power_w,power_samples");
     if (verify) printf(",mismatches");
     printf("\n");
 
@@ -885,12 +957,15 @@ int main(int argc, char **argv)
         init_matrix(V, Vp, dis);
 
         double t0 = 0.0, t1 = 0.0, kernel_seconds = 0.0;
+        double trial_joules = 0.0;
 
         if (run_cpu) {
+            if (measure_energy) rapl_begin();
             t0 = now_seconds();
             fw_cpu(V, dis);
             t1 = now_seconds();
             kernel_seconds = t1 - t0;
+            if (measure_energy) trial_joules = rapl_end_joules();
         } else {
             t0 = now_seconds();
             CUDA_CHECK(cudaMemcpy(dis_d, dis, bytes, cudaMemcpyHostToDevice));
@@ -935,9 +1010,14 @@ int main(int argc, char **argv)
         int nsamp = 0;
         if (measure_energy && !run_cpu)
             energy_ok[t] = power_window(t0, t1, &energy_j[t], &power_w[t], &nsamp);
+        if (measure_energy && run_cpu) {
+            energy_j[t]  = trial_joules;
+            power_w[t]   = trial_joules / (t1 - t0);
+            energy_ok[t] = true;
+        }
 
         printf("%d,%.6f,%.6f", t + 1, kernel_s[t], endtoend_s[t]);
-        if (measure_energy && !run_cpu) {
+        if (measure_energy) {
             if (energy_ok[t]) printf(",%.3f,%.3f,%d", energy_j[t], power_w[t], nsamp);
             else              printf(",,,%d", nsamp);
         }
@@ -965,7 +1045,7 @@ int main(int argc, char **argv)
                         run_cpu ? 0 : (tiled ? TILE * TILE : block_threads),
                         run_cpu ? 0 : grid,
                         t + 1, kernel_s[t], endtoend_s[t]);
-                if (measure_energy && !run_cpu && energy_ok[t])
+                if (measure_energy && energy_ok[t])
                     fprintf(f, "%.3f,%.3f,%d,", energy_j[t], power_w[t], nsamp);
                 else
                     fprintf(f, ",,%d,", nsamp);
@@ -987,7 +1067,7 @@ int main(int argc, char **argv)
     printf("# endtoend_s mean %.6f  std %.6f  over %d trials\n",
            e_mean, stddev_of(endtoend_s, trials, e_mean), trials);
 
-    if (measure_energy && !run_cpu) {
+    if (measure_energy) {
         int good = 0;
         double sum = 0.0;
         for (int t = 0; t < trials; t++) if (energy_ok[t]) { sum += energy_j[t]; good++; }
