@@ -1,12 +1,11 @@
 // floyd_warshall_routing.cu
 //
-// All-pairs shortest path on the GPU, for the network resilience case study of
-// "Toward Optimizing Networking and Cybersecurity Applications Using
-// Domain-Specific Accelerators for Dynamic Programming".
+// All-pairs shortest path on the GPU, for recomputing routes after a
+// topology change.
 //
-// One program covers the kernel variants used in the paper, plus a blocked
-// (tiled) formulation added during the revision. Three flags pick one at run
-// time, so a sweep does not require editing and recompiling:
+// One program covers all the kernel variants, including a blocked (tiled)
+// formulation. Three flags pick one at run time, so a sweep does not require
+// editing and recompiling:
 //
 //   --layout coalesced | strided | tiled   thread to data mapping
 //   --dpx    on | off              DPX instruction, or its plain equivalent
@@ -193,8 +192,8 @@ static void power_stop(void)
 }
 
 // Trapezoidal integration of power over [t0, t1]. Returns false when the window
-// holds fewer than two samples, which is the case the paper reports as an
-// unreliable energy reading at small problem sizes.
+// holds fewer than two samples, which makes the energy reading unreliable at
+// small problem sizes.
 static bool power_window(double t0, double t1, double *energy_j,
                          double *mean_w, int *n_samples)
 {

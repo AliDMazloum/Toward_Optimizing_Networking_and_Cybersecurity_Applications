@@ -1,7 +1,3 @@
-# Makefile for the CUDA sources accompanying
-# "Toward Optimizing Networking and Cybersecurity Applications Using
-#  Domain-Specific Accelerators for Dynamic Programming".
-#
 # App1 is the network resilience system, all-pairs shortest path by
 # Floyd-Warshall. App2 is the deep packet inspection system, signature matching
 # by Smith-Waterman. Binaries are built next to their sources, and their names
@@ -78,26 +74,22 @@ APP2_TARGETS := $(APP2)/smith_waterman_dpi-$(TAG)
 TARGETS      := $(addsuffix -$(TAG),$(BASE_TARGETS))
 
 # Problem sizes used by the check target. Small enough to finish quickly. The
-# planted index comes from the measured regex program and must stay below the
-# signature count.
+# planted index must stay below the signature count.
 CHECK_NODES      ?= 1000
 CHECK_SIGNATURES ?= 10000
 CHECK_PLANT      ?= 1356
 
-# The App1 sweep reported in the paper. Node counts are the topology sizes the
-# manuscript uses; the flags are the protocol the SC'25 measurements followed, so
-# the two are comparable. Each machine writes its own file, because two processes
-# appending to one file on a shared mount interleave their rows.
+# The reported App1 sweep. Each machine writes its own file, because two
+# processes appending to one file on a shared mount interleave their rows.
 SWEEP_NODES  ?= 1000 2000 3000 6000 12000 24000
 SWEEP_TRIALS ?= 5
 SWEEP_WARMUP ?= 1
 SWEEP_FLAGS  ?= --layout coalesced --store changed --sync per-launch
 SWEEP_CSV    ?= app1_final_$(TAG).csv
 
-# The App2 sweep reported in the paper: both configurations
-# (payload, signature length), the signature counts the manuscript's figures
-# use, DPX on and off. Trials and warm-up follow the same protocol as the App1
-# sweep.
+# The reported App2 sweep: both configurations (payload, signature length),
+# the full range of signature counts, DPX on and off. Trials and warm-up
+# follow the same protocol as the App1 sweep.
 SWEEP2_CONFIGS ?= 512x16 1024x32
 SWEEP2_SIGS    ?= 10000 100000 1000000 10000000 20000000 30000000 40000000 50000000
 SWEEP2_TRIALS  ?= 5
@@ -155,7 +147,7 @@ check: $(APP1_TARGETS) $(APP2_TARGETS)
 	  done; \
 	done
 
-# Runs the App1 sweep the paper reports, appending to one file per machine. It
+# Runs the full App1 sweep, appending to one file per machine. It
 # stops at the first failure rather than leaving a half-finished file that looks
 # complete.
 sweep: $(APP1_TARGETS)
@@ -178,7 +170,7 @@ sweep: $(APP1_TARGETS)
 	  done; \
 	done
 
-# Runs the App2 sweep the paper reports, appending to one file per machine,
+# Runs the full App2 sweep, appending to one file per machine,
 # with the same stop-at-first-failure behaviour as the App1 sweep. No match is
 # planted: every thread scans everything, which is the worst case the
 # throughput numbers describe.

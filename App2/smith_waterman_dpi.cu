@@ -1,11 +1,9 @@
 // smith_waterman_dpi.cu
 //
-// Packet-payload signature matching on the GPU, for the deep packet inspection
-// case study of "Toward Optimizing Networking and Cybersecurity Applications
-// Using Domain-Specific Accelerators for Dynamic Programming".
+// Packet-payload signature matching on the GPU.
 //
-// One program covers the kernel variants used in the paper. Flags pick one at
-// run time, so a sweep does not require editing and recompiling:
+// One program covers all the kernel variants. Flags pick one at run time, so
+// a sweep does not require editing and recompiling:
 //
 //   --mode literal | regex       plain signatures, or the regex scoring
 //                                formulation (*, ., ~ contribute specially)
@@ -17,8 +15,8 @@
 //                                same per-halfword computation without it
 //
 // Two signatures are packed per 32-bit word (one per 16-bit halfword), so one
-// thread scores two signatures at once; this is the halfword packing the paper
-// describes, and it is identical in both --dpx arms.
+// thread scores two signatures at once; the packing is identical in both
+// --dpx arms.
 //
 // Every run repeats the whole scan --trials times and reports two timings per
 // trial:
@@ -38,21 +36,6 @@
 // that thread then stops or keeps scanning. --verify recomputes the reported
 // signature's score with a host implementation of the same recurrence and
 // counts a mismatch if the two disagree.
-//
-// The computation is the one the measured programs performed (DPI_v7.2*.cu
-// and DPI_regex_v4.cu, kept under Old_files/): same score arithmetic, same
-// thresholds, same skipped first payload byte; see the comment above the
-// score steps. Exactly three behaviours differ, all chosen because the
-// original behaviour was accidental and none can affect a timing run:
-//
-//   1. the thread guard is >= midpoint, where DPI_v7.2.cu used > and its
-//      last thread read one signature past the end of the buffer,
-//   2. a detection is claimed by atomic compare-and-swap, where the
-//      originals wrote the report fields unguarded and two simultaneous
-//      matches could interleave,
-//   3. in the global-rows layout the DP boundary column is zero, where the
-//      originals' dead initialization loop left one stray word there
-//      (payload byte 0 scored against the last signature character).
 //
 // Build:
 //   nvcc -O3 -arch=sm_90 smith_waterman_dpi.cu -lnvidia-ml -lpthread \
@@ -79,13 +62,11 @@
 // ---------------------------------------------------------------------------
 // Fixed parameters
 //
-// The scoring constants are the ones the measured programs used. Literal mode
-// adds 1 per matching character, so a signature's maximum score is its length
-// and the threshold is a fraction of that length. Regex mode uses the larger
-// match reward so that wildcard positions, which contribute 0, still leave
-// literal matches room to dominate. The >1, >3 and >4 guards keep penalties
-// from acting before an alignment has started, and are carried over unchanged
-// from the measured kernels.
+// Literal mode adds 1 per matching character, so a signature's maximum score
+// is its length and the threshold is a fraction of that length. Regex mode
+// uses the larger match reward so that wildcard positions, which contribute
+// 0, still leave literal matches room to dominate. The >1, >3 and >4 guards
+// keep penalties from acting before an alignment has started.
 // ---------------------------------------------------------------------------
 
 #define LIT_MATCH     1   // literal mode: score added per matching character
@@ -98,7 +79,6 @@
 // Signature lengths the register-row kernel is compiled for. The DP rows and
 // the cached signature bytes can only stay in registers when the inner loop
 // has compile-time bounds, so each supported length is its own instantiation.
-// These are the two configurations the paper evaluates.
 #define SIG_LEN_A 16
 #define SIG_LEN_B 32
 #define MAX_SIG_LEN 32
@@ -135,8 +115,7 @@ static double now_seconds(void)
 //
 // Same sampler as the routing program: it runs for the whole program and keeps
 // its samples in memory, and energy for one trial is obtained by integrating
-// the samples whose timestamps fall inside that trial's window. The original
-// DPI program flushed every sample to disk inside the measured window.
+// the samples whose timestamps fall inside that trial's window.
 // ---------------------------------------------------------------------------
 
 typedef struct {
@@ -284,19 +263,10 @@ static void power_dump_csv(const char *path)
 //   base    = max(H[i-1][j], H[i-1][j-1], H[i][j-1], 0)
 //   H[i][j] = base + score(base, p[i-1], s[j-1])
 //
-// The score steps below compute exactly what the measured programs computed
-// (DPI_v7.2.cu and DPI_regex_v4.cu, kept under Old_files/): same constants,
-// same guards, same results for every input. They are written as conditional
-// selections rather than the originals' chains of boolean multiplications,
-// because the compiler turns selections into cheap predicated instructions
-// while the multiply chains cost 2 to 3 times the kernel time in the --dpx
-// off arm; the host verifier confirms the two forms agree. Three behaviours
-// of those programs are also reproduced exactly because changing them would
-// change what is computed:
+// Three details of the recurrence:
 //
-//   - scanning starts at the second payload character; the measured kernels
-//     initialize the first DP row into dead storage, so payload byte 0 never
-//     enters the recurrence,
+//   - scanning starts at the second payload character, so payload byte 0
+//     never enters the recurrence,
 //   - literal mode tests the BASE value (the max of the three neighbours)
 //     against its threshold with strict greater-than,
 //   - regex mode tests the newly computed cell with greater-or-equal against
@@ -319,10 +289,8 @@ __host__ __device__ __forceinline__ int step_literal(int base, char p, char s)
 }
 
 // Regex scoring: '*' contributes 0 and suppresses the gap penalty, '.' matches
-// any one character contributing 0 (the gap penalty still applies, which is
-// one of the asymmetries reviewer 1 comment 7 asks about), and '~' matches any
-// one digit contributing 0. All three carried over unchanged from the measured
-// kernel.
+// any one character contributing 0 (the gap penalty still applies), and '~'
+// matches any one digit contributing 0.
 __host__ __device__ __forceinline__ int step_regex(int base, char p, char s,
                                                    bool p_is_digit)
 {
@@ -367,9 +335,7 @@ __device__ __forceinline__ uint32_t base_packed(uint32_t n, uint32_t nw, uint32_
 // The report
 //
 // The first crossing claims the report by atomic compare-and-swap, so exactly
-// one thread fills it and the three fields belong to one detection. The
-// original wrote two ints unguarded, which could interleave two threads'
-// matches.
+// one thread fills it and the three fields belong to one detection.
 // ---------------------------------------------------------------------------
 
 typedef struct {
@@ -408,13 +374,11 @@ __global__ void sw_scan(int midpoint, int payload_len,
                         const int *__restrict__ thresholds, int threshold_lit,
                         bool exit_first, Report *report)
 {
-    // Optional compile-time pinning, to reproduce the old programs' fully
-    // hard-coded builds for A/B comparison: -DPIN_SIGNATURES=10000000
+    // Optional compile-time pinning: -DPIN_SIGNATURES=10000000
     // -DPIN_PAYLOAD=512 -DPIN_THRESHOLD=12 -DPIN_EXIT_FIRST=1 turns these
-    // parameters into constants the compiler can optimize against, exactly
-    // as the old sources' #defines did. The host refuses flags that
-    // contradict a pin, so a pinned binary cannot measure the wrong
-    // configuration. An unpinned build is unaffected.
+    // parameters into constants the compiler can optimize against. The host
+    // refuses flags that contradict a pin, so a pinned binary cannot measure
+    // the wrong configuration. An unpinned build is unaffected.
 #ifdef PIN_SIGNATURES
     midpoint = (int)((long long)PIN_SIGNATURES / 2);
 #endif
@@ -461,8 +425,7 @@ __global__ void sw_scan(int midpoint, int payload_len,
 
     bool even = false;
 
-    // i starts at 2: the measured programs never score payload byte 0 (their
-    // first-row initialization went to dead storage), reproduced as-is.
+    // i starts at 2: payload byte 0 is never scored.
     for (int i = 2; i <= payload_len; i++) {
         const char p = c_payload[i - 1];
         const bool pdig = REGEX ? is_ascii_digit(p) : false;
@@ -509,8 +472,8 @@ __global__ void sw_scan(int midpoint, int payload_len,
                 rows[cur + (long long)j * midpoint + gid] = packed;
             }
 
-            // Detection, per mode as measured: regex tests the new cell with
-            // >=, literal tests the base with strict > and reports the base.
+            // Detection, per mode: regex tests the new cell with >=, literal
+            // tests the base with strict > and reports the base.
             if (REGEX) {
                 if (t0 >= thr0) {
                     claim_report(report, t0, gid, i - 1);
@@ -581,9 +544,8 @@ static bool host_scan_signature(bool regex_mode, const char *payload, int P,
 // Signatures and payload are random lowercase letters from a seeded generator,
 // so a run is reproducible from its printed settings. Planting a match copies
 // the planted signature's text into the payload (literal mode), or copies a
-// regex and its matching payload text over the planted slots (regex mode); the
-// regex pair is taken from the measured program, one pair per supported
-// signature length.
+// regex and its matching payload text over the planted slots (regex mode),
+// one pair per supported signature length.
 // ---------------------------------------------------------------------------
 
 static void fill_random_lowercase(char *dst, int n)
@@ -591,12 +553,8 @@ static void fill_random_lowercase(char *dst, int n)
     for (int i = 0; i < n; i++) dst[i] = (char)(rand() % 26 + 'a');
 }
 
-// The 16-character pair uses DPI_regex_v3.cu's spelling, which reaches its
-// full literal score (66) against the payload text and so can be detected.
-// DPI_regex_v4.cu's commented-out spelling, "goo.leM*l.c*ci~m", is a typo:
-// its 'i' has no payload character to match, its best score is 62 under
-// either program's recurrence, and the full-literal-score threshold makes
-// it undetectable.
+// Each signature reaches its full literal score against its payload text, so
+// a planted pair is detectable under the full-literal-score threshold.
 static const char REGEX_SIG_16[] = "goo.leM*l.ci*c~m";
 static const char REGEX_PAT_16[] = "goosleMaliciou.c1m";
 static const char REGEX_SIG_32[] = "This*malware*fro*goo.leM*l.c*c~m";
@@ -610,21 +568,18 @@ static int literal_count(const char *sig, int L)
     return n;
 }
 
-// Thresholds, exactly as the measured programs computed them.
-//
-// Literal mode: the kernel tests base > alpha * L. The original wrote the
-// comparison against the floating value 0.8 * MaxSignatureLength; for integer
-// bases that is the same as strict > against floor(alpha * L), which is what
-// is passed to the kernel.
+// Literal mode: the kernel tests the base against alpha * L; for integer
+// bases that is strict > against floor(alpha * L), which is what is passed
+// to the kernel.
 static int literal_threshold(int L, double alpha)
 {
     return (int)floor(alpha * (double)L);
 }
 
-// Regex mode, from signature_matching_score() in DPI_regex_v4.cu: a signature
-// made only of literals gets alpha of its maximum score with integer
-// truncation (count * RE_MATCH * pct / 100, pct = alpha as a percentage); a
-// signature containing any wildcard must reach its full literal score.
+// Regex mode: a signature made only of literals gets alpha of its maximum
+// score with integer truncation (count * RE_MATCH * pct / 100, pct = alpha
+// as a percentage); a signature containing any wildcard must reach its full
+// literal score.
 static int regex_threshold(const char *sig, int L, double alpha)
 {
     const int count = literal_count(sig, L);
@@ -710,8 +665,7 @@ static void print_usage(const char *prog)
     printf("                      (default registers)\n");
     printf("  --dpx <state>       on | off (default on)\n");
     printf("  --alpha <float>     detection threshold fraction, in (0, 1]\n");
-    printf("                      (default 0.8), applied as the measured\n");
-    printf("                      programs applied it: literal detects when a\n");
+    printf("                      (default 0.8): literal detects when a\n");
     printf("                      base score exceeds alpha * length; a regex\n");
     printf("                      signature with wildcards needs its full\n");
     printf("                      literal score\n");
@@ -882,9 +836,9 @@ int main(int argc, char **argv)
         if (regex_mode) {
             const char *sig_text = (L == SIG_LEN_B) ? REGEX_SIG_32 : REGEX_SIG_16;
             const char *pat_text = (L == SIG_LEN_B) ? REGEX_PAT_32 : REGEX_PAT_16;
-            // The measured program planted the payload text at offset 5, and
-            // payload byte 0 is never scored, so offset 0 would lose the
-            // pattern's first character.
+            // The payload text is planted at offset 5: payload byte 0 is
+            // never scored, so offset 0 would lose the pattern's first
+            // character.
             if ((int)(5 + strlen(pat_text)) > P) {
                 fprintf(stderr, "--payload too short for the planted regex"
                                 " payload text (%zu bytes at offset 5)\n",
@@ -894,10 +848,10 @@ int main(int argc, char **argv)
             memcpy(slot_p, sig_text, (size_t)L);     // both texts are exactly L
             memcpy(payload + 5, pat_text, strlen(pat_text));
         } else {
-            // The planted signature's text becomes the start of the payload,
-            // as in the measured program. Payload byte 0 is never scored, so
-            // the usable match is L - 1 characters and the plant is detected
-            // for alpha up to about (L - 2) / L.
+            // The planted signature's text becomes the start of the payload.
+            // Payload byte 0 is never scored, so the usable match is L - 1
+            // characters and the plant is detected for alpha up to about
+            // (L - 2) / L.
             memcpy(payload, slot_p, (size_t)L);
         }
     }
