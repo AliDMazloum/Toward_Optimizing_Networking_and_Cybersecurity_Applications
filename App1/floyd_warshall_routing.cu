@@ -546,11 +546,76 @@ static const char *cpu_desc(void)
 // ---------------------------------------------------------------------------
 // Problem set-up and checking
 //
-// The topology is a directed chain: vertex i has one outgoing edge to vertex
-// i+1 of weight 1. Its all-pairs distance matrix is known in closed form,
-// D[i][j] = j - i for j >= i and INF otherwise, which gives an exact oracle for
-// every entry rather than a spot check.
+// Two topologies. The chain is a directed line: vertex i has one outgoing
+// edge to vertex i+1 of weight 1, and its all-pairs distance matrix is known
+// in closed form, D[i][j] = j - i for j >= i and INF otherwise, an exact
+// oracle for every entry. The scale-free topology is Barabasi and Albert's
+// preferential attachment, undirected with weight 1 on every edge, so
+// distances are hop counts; it has no closed form, so those runs are checked
+// against the host triple loop instead.
 // ---------------------------------------------------------------------------
+
+typedef enum { TOPO_CHAIN, TOPO_SCALE_FREE } Topology;
+
+static const char *topology_name(Topology t)
+{
+    return t == TOPO_CHAIN ? "chain" : "scale-free";
+}
+
+// Preferential attachment: the first attach+1 vertices form a complete
+// graph, and every later vertex adds edges to attach distinct earlier
+// vertices, each chosen with probability proportional to its current degree.
+// Sampling uniformly from the list of edge endpoints realises that
+// probability. Every vertex connects to an earlier one, so the graph is
+// connected. rand() is seeded from --seed, so a run reproduces from its
+// printed settings.
+static void generate_scale_free(int V, int attach, unsigned seed,
+                                int **eu_out, int **ev_out, long long *ne_out)
+{
+    const int m0 = attach + 1;
+    const long long ne = (long long)m0 * (m0 - 1) / 2 +
+                         (long long)(V - m0) * attach;
+    if (2 * ne > (long long)RAND_MAX) {
+        fprintf(stderr, "The endpoint pool exceeds RAND_MAX; use fewer nodes"
+                        " or a smaller --attach\n");
+        exit(1);
+    }
+    int *eu     = (int *)malloc((size_t)ne * sizeof(int));
+    int *ev     = (int *)malloc((size_t)ne * sizeof(int));
+    int *pool   = (int *)malloc((size_t)2 * ne * sizeof(int));
+    int *picked = (int *)calloc(V, sizeof(int));
+    if (eu == NULL || ev == NULL || pool == NULL || picked == NULL) {
+        fprintf(stderr, "Topology allocation failed\n");
+        exit(1);
+    }
+    srand(seed);
+    long long e = 0, p = 0;
+    for (int i = 0; i < m0; i++) {
+        for (int j = i + 1; j < m0; j++) {
+            eu[e] = i; ev[e] = j; e++;
+            pool[p++] = i; pool[p++] = j;
+        }
+    }
+    for (int v = m0; v < V; v++) {
+        for (int k = 0; k < attach; k++) {
+            int target;
+            // picked stamps the targets already taken for this vertex, so
+            // the attach edges go to distinct vertices; v itself enters the
+            // pool inside this loop, so it is skipped explicitly.
+            do {
+                target = pool[rand() % p];
+            } while (target == v || picked[target] == v + 1);
+            picked[target] = v + 1;
+            eu[e] = v; ev[e] = target; e++;
+            pool[p++] = v; pool[p++] = target;
+        }
+    }
+    free(pool);
+    free(picked);
+    *eu_out = eu;
+    *ev_out = ev;
+    *ne_out = ne;
+}
 
 // The matrix is pitch x pitch. The tiled layout pads pitch above V; padded
 // cells (row or column at or beyond V) are INF in both directions, so no real
@@ -578,6 +643,32 @@ static long long count_mismatches(int V, int pitch, const int *dis)
             if (dis[(long long)i * pitch + j] != expected) bad++;
         }
     }
+    return bad;
+}
+
+// Fills the pitched matrix from an undirected unit-weight edge list. Padded
+// cells stay INF in both directions, as in the chain initialiser.
+static void init_matrix_edges(int V, int pitch, int *dis,
+                              const int *eu, const int *ev, long long ne)
+{
+    for (long long i = 0; i < (long long)pitch * pitch; i++) dis[i] = INF;
+    for (int i = 0; i < V; i++) dis[(long long)i * pitch + i] = 0;
+    for (long long e = 0; e < ne; e++) {
+        dis[(long long)eu[e] * pitch + ev[e]] = 1;
+        dis[(long long)ev[e] * pitch + eu[e]] = 1;
+    }
+}
+
+// Comparison against a reference distance matrix of pitch V, for topologies
+// with no closed form.
+static long long count_mismatches_ref(int V, int pitch, const int *dis,
+                                      const int *ref)
+{
+    long long bad = 0;
+    for (int i = 0; i < V; i++)
+        for (int j = 0; j < V; j++)
+            if (dis[(long long)i * pitch + j] != ref[(long long)i * V + j])
+                bad++;
     return bad;
 }
 
@@ -737,6 +828,11 @@ static void print_usage(const char *prog)
     printf("                      (default %d; the tiled layout's block is fixed\n",
            BLOCK_THREADS_DEFAULT);
     printf("                      by the tile geometry)\n");
+    printf("  --topology <name>   chain | scale-free: the evaluated graph\n");
+    printf("                      (default chain)\n");
+    printf("  --attach <int>      scale-free: edges each new vertex adds\n");
+    printf("                      (default 2)\n");
+    printf("  --seed <int>        scale-free: generator seed (default 1)\n");
     printf("  --trials <int>      measured repetitions (default 1)\n");
     printf("  --warmup <int>      unmeasured repetitions first (default 1)\n");
     printf("  --sync <state>      per-launch | none: host synchronization after\n");
@@ -769,6 +865,9 @@ int main(int argc, char **argv)
     bool  store_changed = false;
     int   block_threads = BLOCK_THREADS_DEFAULT;
     bool  block_set   = false;
+    Topology topo     = TOPO_CHAIN;
+    int      attach   = 2;
+    unsigned seed     = 1;
     const char *csv_path = NULL;
     const char *power_csv_path = NULL;
 
@@ -778,6 +877,15 @@ int main(int argc, char **argv)
             return 0;
         } else if (!strcmp(argv[i], "--nodes") && i + 1 < argc) {
             V = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--topology") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "chain"))           topo = TOPO_CHAIN;
+            else if (!strcmp(v, "scale-free")) topo = TOPO_SCALE_FREE;
+            else { fprintf(stderr, "Unknown topology: %s\n", v); return 1; }
+        } else if (!strcmp(argv[i], "--attach") && i + 1 < argc) {
+            attach = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
+            seed = (unsigned)atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--layout") && i + 1 < argc) {
             const char *v = argv[++i];
             if (!strcmp(v, "coalesced"))    layout = LAYOUT_COALESCED;
@@ -839,6 +947,15 @@ int main(int argc, char **argv)
                         " block is fixed at %d x %d threads\n", TILE, TILE);
         return 1;
     }
+    if (topo == TOPO_SCALE_FREE && (attach < 1 || attach + 1 > V)) {
+        fprintf(stderr, "--attach must be at least 1 and below --nodes\n");
+        return 1;
+    }
+
+    int *edge_u = NULL, *edge_v = NULL;
+    long long n_edges = 0;
+    if (topo == TOPO_SCALE_FREE)
+        generate_scale_free(V, attach, seed, &edge_u, &edge_v, &n_edges);
 
     // The tiled layout computes on a matrix padded up to a whole number of
     // tiles; the correctness check still reads only the real V x V entries.
@@ -878,6 +995,12 @@ int main(int argc, char **argv)
     // Every setting that affects a number is printed, so a run documents itself.
     printf("# program           : floyd_warshall_routing\n");
     printf("# nodes             : %d\n", V);
+    printf("# topology          : %s\n", topology_name(topo));
+    if (topo == TOPO_SCALE_FREE) {
+        printf("# attach            : %d edges per new vertex\n", attach);
+        printf("# seed              : %u\n", seed);
+        printf("# edges             : %lld undirected, weight 1\n", n_edges);
+    }
     printf("# matrix_bytes      : %zu\n", bytes);
     printf("# target            : %s\n", run_cpu ? "cpu" : "gpu");
     if (run_cpu)
@@ -907,7 +1030,10 @@ int main(int argc, char **argv)
     }
     printf("# trials            : %d\n", trials);
     printf("# warmup            : %d (not reported)\n", warmup);
-    printf("# verify            : %s\n", verify ? "on" : "off");
+    printf("# verify            : %s\n",
+           !verify ? "off" :
+           topo == TOPO_CHAIN ? "on, against the closed form"
+                              : "on, against the host triple loop");
     printf("# kernel_window     : the %s only\n",
            run_cpu ? "triple loop" : "kernel launches");
     if (run_cpu)
@@ -933,6 +1059,22 @@ int main(int argc, char **argv)
                " edges\n", g_rapl_pkgs);
     }
 
+    // The chain is checked against its closed form; a generated topology is
+    // checked against the host triple loop instead, computed once because
+    // the inputs are identical in every trial.
+    int *ref = NULL;
+    if (verify && topo != TOPO_CHAIN) {
+        const size_t ref_bytes = (size_t)V * (size_t)V * sizeof(int);
+        ref = (int *)malloc(ref_bytes);
+        if (ref == NULL) {
+            fprintf(stderr, "Reference allocation of %.2f GB failed\n",
+                    ref_bytes / 1e9);
+            return 1;
+        }
+        init_matrix_edges(V, V, ref, edge_u, edge_v, n_edges);
+        fw_cpu(V, ref);
+    }
+
     double *kernel_s   = (double *)calloc(trials, sizeof(double));
     double *endtoend_s = (double *)calloc(trials, sizeof(double));
     double *energy_j   = (double *)calloc(trials, sizeof(double));
@@ -954,7 +1096,10 @@ int main(int argc, char **argv)
         const bool measured = (t >= 0);
 
         // Rebuilding the matrix is outside both windows.
-        init_matrix(V, Vp, dis);
+        if (topo == TOPO_CHAIN)
+            init_matrix(V, Vp, dis);
+        else
+            init_matrix_edges(V, Vp, dis, edge_u, edge_v, n_edges);
 
         double t0 = 0.0, t1 = 0.0, kernel_seconds = 0.0;
         double trial_joules = 0.0;
@@ -1000,7 +1145,11 @@ int main(int argc, char **argv)
             t1 = now_seconds();
         }
 
-        long long bad = verify ? count_mismatches(V, Vp, dis) : 0;
+        long long bad = 0;
+        if (verify)
+            bad = (topo == TOPO_CHAIN)
+                ? count_mismatches(V, Vp, dis)
+                : count_mismatches_ref(V, Vp, dis, ref);
 
         if (!measured) continue;
 
@@ -1032,11 +1181,12 @@ int main(int argc, char **argv)
             } else {
                 fseek(f, 0, SEEK_END);
                 if (ftell(f) == 0)
-                    fprintf(f, "nodes,target,gpu,layout,dpx,store,sync,block_threads,"
-                               "grid_blocks,trial,kernel_s,endtoend_s,energy_j,"
+                    fprintf(f, "nodes,topology,target,gpu,layout,dpx,store,sync,"
+                               "block_threads,grid_blocks,trial,kernel_s,"
+                               "endtoend_s,energy_j,"
                                "mean_power_w,power_samples,mismatches\n");
-                fprintf(f, "%d,%s,%s,%s,%s,%s,%s,%d,%d,%d,%.6f,%.6f,",
-                        V, run_cpu ? "cpu" : "gpu",
+                fprintf(f, "%d,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%.6f,%.6f,",
+                        V, topology_name(topo), run_cpu ? "cpu" : "gpu",
                         run_cpu ? cpu_desc() : prop.name,
                         run_cpu ? "n/a" : layout_name(layout),
                         run_cpu ? "n/a" : (use_dpx ? "on" : "off"),
@@ -1090,6 +1240,9 @@ int main(int argc, char **argv)
         CUDA_CHECK(cudaFree(dis_d));
     }
     free(dis);
+    free(ref);
+    free(edge_u);
+    free(edge_v);
     free(kernel_s);
     free(endtoend_s);
     free(energy_j);
