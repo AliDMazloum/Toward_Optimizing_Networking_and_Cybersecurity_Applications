@@ -39,6 +39,21 @@
 // signature's score with a host implementation of the same recurrence and
 // counts a mismatch if the two disagree.
 //
+// The computation is the one the measured programs performed (DPI_v7.2*.cu
+// and DPI_regex_v4.cu, kept under Old_files/): same score arithmetic, same
+// thresholds, same skipped first payload byte; see the comment above the
+// score steps. Exactly three behaviours differ, all chosen because the
+// original behaviour was accidental and none can affect a timing run:
+//
+//   1. the thread guard is >= midpoint, where DPI_v7.2.cu used > and its
+//      last thread read one signature past the end of the buffer,
+//   2. a detection is claimed by atomic compare-and-swap, where the
+//      originals wrote the report fields unguarded and two simultaneous
+//      matches could interleave,
+//   3. in the global-rows layout the DP boundary column is zero, where the
+//      originals' dead initialization loop left one stray word there
+//      (payload byte 0 scored against the last signature character).
+//
 // Build:
 //   nvcc -O3 -arch=sm_90 smith_waterman_dpi.cu -lnvidia-ml -lpthread \
 //        -o smith_waterman_dpi
@@ -269,11 +284,23 @@ static void power_dump_csv(const char *path)
 //   base    = max(H[i-1][j], H[i-1][j-1], H[i][j-1], 0)
 //   H[i][j] = base + score(base, p[i-1], s[j-1])
 //
-// and a signature is reported when H[i][j] reaches its threshold. The score
-// step is shared, host and device, so the host reference and the kernels
-// cannot drift apart: the kernels apply exactly these functions to each
-// 16-bit halfword, and the only thing --dpx changes is whether the base is
-// computed by the DPX instruction or by the plain equivalent below it.
+// The score steps below are transliterated from the measured programs
+// (DPI_v7.2.cu and DPI_regex_v4.cu, kept under Old_files/), same constants,
+// same guards, same branch-free arithmetic. Three behaviours of those
+// programs are also reproduced exactly because changing them would change
+// what is computed:
+//
+//   - scanning starts at the second payload character; the measured kernels
+//     initialize the first DP row into dead storage, so payload byte 0 never
+//     enters the recurrence,
+//   - literal mode tests the BASE value (the max of the three neighbours)
+//     against its threshold with strict greater-than,
+//   - regex mode tests the newly computed cell with greater-or-equal against
+//     a per-signature threshold.
+//
+// The score step is shared, host and device, so the host reference and the
+// kernels cannot drift apart, and the only thing --dpx changes is whether
+// the base is computed by the DPX instruction or by the plain equivalent.
 // ---------------------------------------------------------------------------
 
 __host__ __device__ __forceinline__ bool is_ascii_digit(char c)
@@ -283,30 +310,29 @@ __host__ __device__ __forceinline__ bool is_ascii_digit(char c)
 
 __host__ __device__ __forceinline__ int step_literal(int base, char p, char s)
 {
-    if (p == s) return base + LIT_MATCH;
-    return base > 1 ? base + LIT_MISMATCH : base;
+    const bool a = (p == s);
+    return base + LIT_MATCH * a + LIT_MISMATCH * (!a) * (base > 1);
 }
 
 // Regex scoring: '*' contributes 0 and suppresses the gap penalty, '.' matches
 // any one character contributing 0 (the gap penalty still applies, which is
 // one of the asymmetries reviewer 1 comment 7 asks about), and '~' matches any
 // one digit contributing 0. All three carried over unchanged from the measured
-// kernel.
+// kernel, in its own condition encoding: c1 = not '*', c2 = not '.', c3 = not
+// '~', c4 = characters equal.
 __host__ __device__ __forceinline__ int step_regex(int base, char p, char s,
                                                    bool p_is_digit)
 {
-    const bool star  = (s == '*');
-    const bool any1  = (s == '.');
-    const bool digit = (s == '~');
+    const bool c1 = (s != '*');
+    const bool c2 = (s != '.');
+    const bool c3 = (s != '~');
+    const bool c4 = (p == s);
+    const bool c5 = !c4;
 
-    int t = base;
-    if (base > 3 && p != s && !star) t += RE_INDEL;
-    if (!star && !any1 && !digit) {
-        if (p == s)       t += RE_MATCH;
-        else if (base > 4) t += RE_MISMATCH;
-    }
-    if (digit && base > 4 && !p_is_digit) t += RE_MISMATCH;
-    return t;
+    return base
+         + (base > 3) * c5 * c1 * RE_INDEL
+         + c1 * c2 * c3 * (c4 * RE_MATCH + (base > 4) * c5 * RE_MISMATCH)
+         + (base > 4) * (!c3) * RE_MISMATCH * (!p_is_digit);
 }
 
 __host__ __device__ __forceinline__ int max3_relu(int a, int b, int c)
@@ -316,21 +342,25 @@ __host__ __device__ __forceinline__ int max3_relu(int a, int b, int c)
     return m > 0 ? m : 0;
 }
 
+__device__ __forceinline__ uint32_t umax3(uint32_t a, uint32_t b, uint32_t c)
+{
+    uint32_t m = a > b ? a : b;
+    return c > m ? c : m;
+}
+
 // The packed base: max of three values and 0, per signed 16-bit halfword. The
-// DPX arm is one instruction on compute capability 9.0; the plain arm is the
-// same computation spelled out, and is what --dpx off measures on the same
-// chip.
+// DPX arm is one instruction on compute capability 9.0; the plain arm is what
+// --dpx off measures on the same chip. Every halfword the kernel ever stores
+// is non-negative (the guards in the score steps never drive a cell below
+// zero), so the signed max-with-relu reduces to an unsigned max per halfword,
+// with no sign extension.
 template <bool USE_DPX>
 __device__ __forceinline__ uint32_t base_packed(uint32_t n, uint32_t nw, uint32_t w)
 {
     if (USE_DPX) return __vimax3_s16x2_relu(n, nw, w);
-    const int lo = max3_relu((int)(int16_t)(n  & 0xFFFFu),
-                             (int)(int16_t)(nw & 0xFFFFu),
-                             (int)(int16_t)(w  & 0xFFFFu));
-    const int hi = max3_relu((int)(int16_t)(n  >> 16),
-                             (int)(int16_t)(nw >> 16),
-                             (int)(int16_t)(w  >> 16));
-    return (uint32_t)(uint16_t)lo | ((uint32_t)(uint16_t)hi << 16);
+    const uint32_t lo = umax3(n & 0xFFFFu, nw & 0xFFFFu, w & 0xFFFFu);
+    const uint32_t hi = umax3(n >> 16, nw >> 16, w >> 16);
+    return lo | (hi << 16);
 }
 
 // ---------------------------------------------------------------------------
@@ -411,9 +441,11 @@ __global__ void sw_scan(int midpoint, int payload_len,
 
     bool even = false;
 
-    for (int i = 1; i <= payload_len; i++) {
+    // i starts at 2: the measured programs never score payload byte 0 (their
+    // first-row initialization went to dead storage), reproduced as-is.
+    for (int i = 2; i <= payload_len; i++) {
         const char p = c_payload[i - 1];
-        const bool pdig = is_ascii_digit(p);
+        const bool pdig = REGEX ? is_ascii_digit(p) : false;
         even = !even;
 
         // Row blocks for this payload character: cur is being written, prev
@@ -437,9 +469,10 @@ __global__ void sw_scan(int midpoint, int payload_len,
                 w  = rows[cur  + (long long)(j - 1) * midpoint + gid];
             }
 
+            // No sign extension on unpack: every stored halfword is >= 0.
             const uint32_t base2 = base_packed<USE_DPX>(n, nw, w);
-            const int b0 = (int)(int16_t)(base2 & 0xFFFFu);
-            const int b1 = (int)(int16_t)(base2 >> 16);
+            const int b0 = (int)(base2 & 0xFFFFu);
+            const int b1 = (int)(base2 >> 16);
 
             const char s0 = ROWS_REG ? sig0[j - 1] : signatures[off0 + j - 1];
             const char s1 = ROWS_REG ? sig1[j - 1] : signatures[off1 + j - 1];
@@ -449,20 +482,31 @@ __global__ void sw_scan(int midpoint, int payload_len,
             const int t1 = REGEX ? step_regex(b1, p, s1, pdig)
                                  : step_literal(b1, p, s1);
 
-            const uint32_t packed =
-                (uint32_t)(uint16_t)t0 | ((uint32_t)(uint16_t)t1 << 16);
+            const uint32_t packed = (uint32_t)t0 | ((uint32_t)t1 << 16);
             if (ROWS_REG) {
                 if (even) rowB[j] = packed; else rowA[j] = packed;
             } else {
                 rows[cur + (long long)j * midpoint + gid] = packed;
             }
 
-            if (t0 >= thr0) {
-                claim_report(report, t0, gid, i - 1);
-                if (exit_first) return;
-            } else if (t1 >= thr1) {
-                claim_report(report, t1, gid + midpoint, i - 1);
-                if (exit_first) return;
+            // Detection, per mode as measured: regex tests the new cell with
+            // >=, literal tests the base with strict > and reports the base.
+            if (REGEX) {
+                if (t0 >= thr0) {
+                    claim_report(report, t0, gid, i - 1);
+                    if (exit_first) return;
+                } else if (t1 >= thr1) {
+                    claim_report(report, t1, gid + midpoint, i - 1);
+                    if (exit_first) return;
+                }
+            } else {
+                if (b0 > thr0) {
+                    claim_report(report, b0, gid, i - 1);
+                    if (exit_first) return;
+                } else if (b1 > thr1) {
+                    claim_report(report, b1, gid + midpoint, i - 1);
+                    if (exit_first) return;
+                }
             }
         }
     }
@@ -472,10 +516,12 @@ __global__ void sw_scan(int midpoint, int payload_len,
 // Host reference
 //
 // The same recurrence on the host, one signature at a time, through the same
-// score-step functions the kernel uses. Returns true at the first threshold
+// score-step functions the kernel uses, with the same detection semantics:
+// payload byte 0 unscored, literal tested on the base with strict >, regex
+// tested on the new cell with >=. Returns true at the first threshold
 // crossing with its score and position, which for a given signature is
 // deterministic, so a reported detection must reproduce exactly. When nothing
-// crosses, best_out holds the maximum score seen.
+// crosses, best_out holds the maximum cell value seen.
 // ---------------------------------------------------------------------------
 
 static bool host_scan_signature(bool regex_mode, const char *payload, int P,
@@ -486,7 +532,7 @@ static bool host_scan_signature(bool regex_mode, const char *payload, int P,
     int cur[MAX_SIG_LEN + 1]  = { 0 };
     int best = 0;
 
-    for (int i = 1; i <= P; i++) {
+    for (int i = 2; i <= P; i++) {
         const char p = payload[i - 1];
         const bool pdig = is_ascii_digit(p);
         cur[0] = 0;
@@ -496,8 +542,8 @@ static bool host_scan_signature(bool regex_mode, const char *payload, int P,
                                      : step_literal(base, p, sig[j - 1]);
             cur[j] = t;
             if (t > best) best = t;
-            if (t >= thr) {
-                *score_out = t;
+            if (regex_mode ? (t >= thr) : (base > thr)) {
+                *score_out = regex_mode ? t : base;
                 *pos_out   = i - 1;
                 *best_out  = best;
                 return true;
@@ -538,16 +584,27 @@ static int literal_count(const char *sig, int L)
     return n;
 }
 
-// A signature's threshold is alpha times its maximum attainable score, rounded
-// up: length in literal mode (each match adds 1), RE_MATCH per literal
-// character in regex mode (wildcards contribute 0). The measured programs
-// hard-coded alpha = 0.8 and, in regex mode, required a perfect literal score
-// from any signature containing a wildcard; alpha now applies uniformly.
-static int signature_threshold(bool regex_mode, const char *sig, int L,
-                               double alpha)
+// Thresholds, exactly as the measured programs computed them.
+//
+// Literal mode: the kernel tests base > alpha * L. The original wrote the
+// comparison against the floating value 0.8 * MaxSignatureLength; for integer
+// bases that is the same as strict > against floor(alpha * L), which is what
+// is passed to the kernel.
+static int literal_threshold(int L, double alpha)
 {
-    const int smax = regex_mode ? RE_MATCH * literal_count(sig, L) : L;
-    return (int)ceil(alpha * smax);
+    return (int)floor(alpha * (double)L);
+}
+
+// Regex mode, from signature_matching_score() in DPI_regex_v4.cu: a signature
+// made only of literals gets alpha of its maximum score with integer
+// truncation (count * RE_MATCH * pct / 100, pct = alpha as a percentage); a
+// signature containing any wildcard must reach its full literal score.
+static int regex_threshold(const char *sig, int L, double alpha)
+{
+    const int count = literal_count(sig, L);
+    const int pct   = (int)(alpha * 100.0 + 0.5);
+    if (count == L) return count * RE_MATCH * pct / 100;
+    return count * RE_MATCH;
 }
 
 // ---------------------------------------------------------------------------
@@ -626,9 +683,12 @@ static void print_usage(const char *prog)
     printf("  --rows <where>      registers | global: where the DP rows live\n");
     printf("                      (default registers)\n");
     printf("  --dpx <state>       on | off (default on)\n");
-    printf("  --alpha <float>     detection threshold as a fraction of a\n");
-    printf("                      signature's maximum score, in (0, 1]\n");
-    printf("                      (default 0.8)\n");
+    printf("  --alpha <float>     detection threshold fraction, in (0, 1]\n");
+    printf("                      (default 0.8), applied as the measured\n");
+    printf("                      programs applied it: literal detects when a\n");
+    printf("                      base score exceeds alpha * length; a regex\n");
+    printf("                      signature with wildcards needs its full\n");
+    printf("                      literal score\n");
     printf("  --block <int>       threads per block (default 32)\n");
     printf("  --exit <policy>     first | never: a matching thread stops at its\n");
     printf("                      first report, or scans everything (default first)\n");
@@ -796,16 +856,22 @@ int main(int argc, char **argv)
         if (regex_mode) {
             const char *sig_text = (L == SIG_LEN_B) ? REGEX_SIG_32 : REGEX_SIG_16;
             const char *pat_text = (L == SIG_LEN_B) ? REGEX_PAT_32 : REGEX_PAT_16;
-            if ((int)strlen(pat_text) > P) {
+            // The measured program planted the payload text at offset 5, and
+            // payload byte 0 is never scored, so offset 0 would lose the
+            // pattern's first character.
+            if ((int)(5 + strlen(pat_text)) > P) {
                 fprintf(stderr, "--payload too short for the planted regex"
-                                " payload text (%zu bytes)\n", strlen(pat_text));
+                                " payload text (%zu bytes at offset 5)\n",
+                        strlen(pat_text));
                 return 1;
             }
             memcpy(slot_p, sig_text, (size_t)L);     // both texts are exactly L
-            memcpy(payload, pat_text, strlen(pat_text));
+            memcpy(payload + 5, pat_text, strlen(pat_text));
         } else {
             // The planted signature's text becomes the start of the payload,
-            // so a full-length match exists for any alpha up to 1.
+            // as in the measured program. Payload byte 0 is never scored, so
+            // the usable match is L - 1 characters and the plant is detected
+            // for alpha up to about (L - 2) / L.
             memcpy(payload, slot_p, (size_t)L);
         }
     }
@@ -814,7 +880,7 @@ int main(int argc, char **argv)
     // Thresholds
     // ------------------------------------------------------------------
 
-    const int threshold_lit = signature_threshold(false, NULL, L, alpha);
+    const int threshold_lit = literal_threshold(L, alpha);
 
     int *thresholds = NULL;
     if (regex_mode) {
@@ -824,8 +890,8 @@ int main(int argc, char **argv)
             return 1;
         }
         for (long long k = 0; k < N; k++)
-            thresholds[k] = signature_threshold(true, signatures + (size_t)k * slot,
-                                                L, alpha);
+            thresholds[k] = regex_threshold(signatures + (size_t)k * slot,
+                                            L, alpha);
     }
 
     // The threshold the verifier applies to signature k.
@@ -913,10 +979,12 @@ int main(int argc, char **argv)
             printf("# threshold         : %d (random signatures)\n",
                    thresholds[rnd]);
     } else {
-        printf("# threshold         : %d of a maximum %d\n", threshold_lit, L);
+        printf("# threshold         : base score > %d, of a maximum %d\n",
+               threshold_lit, L);
     }
-    printf("# cell_updates      : %.0f per trial\n",
-           (double)N * (double)P * (double)L);
+    printf("# cell_updates      : %.0f per trial (payload bytes 1..%d;"
+           " byte 0 is never scored)\n",
+           (double)N * (double)(P - 1) * (double)L, P - 1);
     printf("# target            : %s\n", run_cpu ? "cpu (serial reference)" : "gpu");
     if (!run_cpu) {
         printf("# gpu               : %s\n", prop.name);
