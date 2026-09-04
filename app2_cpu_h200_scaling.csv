@@ -1,0 +1,10 @@
+signatures,payload,sig_len,mode,rows,dpx,alpha,block_threads,grid_blocks,exit,plant,seed,target,gpu,trial,kernel_s,endtoend_s,energy_j,mean_power_w,power_samples,found,report_sig,report_score,report_pos,mismatches
+10000,512,16,literal,n/a,n/a,0.8,0,0,first,-1,1,cpu,openmp-64,1,0.019410,0.019410,,,0,0,,,,0
+10000,512,16,literal,n/a,n/a,0.8,0,0,first,-1,1,cpu,openmp-64,2,0.015416,0.015416,,,0,0,,,,0
+10000,512,16,literal,n/a,n/a,0.8,0,0,first,-1,1,cpu,openmp-64,3,0.019226,0.019226,,,0,0,,,,0
+100000,512,16,literal,n/a,n/a,0.8,0,0,first,-1,1,cpu,openmp-64,1,0.086429,0.086429,,,0,0,,,,0
+100000,512,16,literal,n/a,n/a,0.8,0,0,first,-1,1,cpu,openmp-64,2,0.086554,0.086554,,,0,0,,,,0
+100000,512,16,literal,n/a,n/a,0.8,0,0,first,-1,1,cpu,openmp-64,3,0.084774,0.084774,,,0,0,,,,0
+1000000,512,16,literal,n/a,n/a,0.8,0,0,first,-1,1,cpu,openmp-64,1,0.677660,0.677660,,,0,0,,,,0
+1000000,512,16,literal,n/a,n/a,0.8,0,0,first,-1,1,cpu,openmp-64,2,0.684483,0.684483,,,0,0,,,,0
+1000000,512,16,literal,n/a,n/a,0.8,0,0,first,-1,1,cpu,openmp-64,3,0.688201,0.688201,,,0,0,,,,0

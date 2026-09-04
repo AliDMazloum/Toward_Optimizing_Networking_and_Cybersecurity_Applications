@@ -1,0 +1,10 @@
+nodes,target,gpu,layout,dpx,store,sync,block_threads,grid_blocks,trial,kernel_s,endtoend_s,energy_j,mean_power_w,power_samples,mismatches
+1000,cpu,openmp-64,n/a,n/a,n/a,n/a,0,0,1,8.812179,8.812179,,,0,0
+1000,cpu,openmp-64,n/a,n/a,n/a,n/a,0,0,2,8.794240,8.794240,,,0,0
+1000,cpu,openmp-64,n/a,n/a,n/a,n/a,0,0,3,6.656765,6.656765,,,0,0
+2000,cpu,openmp-64,n/a,n/a,n/a,n/a,0,0,1,14.909630,14.909630,,,0,0
+2000,cpu,openmp-64,n/a,n/a,n/a,n/a,0,0,2,12.719153,12.719153,,,0,0
+2000,cpu,openmp-64,n/a,n/a,n/a,n/a,0,0,3,9.152082,9.152082,,,0,0
+3000,cpu,openmp-64,n/a,n/a,n/a,n/a,0,0,1,13.985434,13.985434,,,0,0
+3000,cpu,openmp-64,n/a,n/a,n/a,n/a,0,0,2,19.482393,19.482393,,,0,0
+3000,cpu,openmp-64,n/a,n/a,n/a,n/a,0,0,3,17.350931,17.350931,,,0,0
