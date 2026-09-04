@@ -1,3 +1,4 @@
+.env
 *.o
 *.obj
 *.exe
@@ -21,5 +22,7 @@ dpi_occupancy_focused_variant
 dpi_occupancy_focused_variant-*
 dpi_regex_matching
 dpi_regex_matching-*
+smith_waterman_dpi
+smith_waterman_dpi-*
 floyd_warshall_routing
 floyd_warshall_routing-*
