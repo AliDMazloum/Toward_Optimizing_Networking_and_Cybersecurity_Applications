@@ -26,6 +26,8 @@ smith_waterman_dpi
 smith_waterman_dpi-*
 floyd_warshall_routing
 floyd_warshall_routing-*
+dpi_old_h200
+dpi_old_h200-*
 
 # Large data files not meant for version control
 signatures.txt
