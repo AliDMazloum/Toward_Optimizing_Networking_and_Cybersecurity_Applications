@@ -571,7 +571,13 @@ static void fill_random_lowercase(char *dst, int n)
     for (int i = 0; i < n; i++) dst[i] = (char)(rand() % 26 + 'a');
 }
 
-static const char REGEX_SIG_16[] = "goo.leM*l.c*ci~m";
+// The 16-character pair uses DPI_regex_v3.cu's spelling, which reaches its
+// full literal score (66) against the payload text and so can be detected.
+// DPI_regex_v4.cu's commented-out spelling, "goo.leM*l.c*ci~m", is a typo:
+// its 'i' has no payload character to match, its best score is 62 under
+// either program's recurrence, and the full-literal-score threshold makes
+// it undetectable.
+static const char REGEX_SIG_16[] = "goo.leM*l.ci*c~m";
 static const char REGEX_PAT_16[] = "goosleMaliciou.c1m";
 static const char REGEX_SIG_32[] = "This*malware*fro*goo.leM*l.c*c~m";
 static const char REGEX_PAT_32[] = "ThisisamalwareobtainedfromgoosleMaliciou.c1m";
