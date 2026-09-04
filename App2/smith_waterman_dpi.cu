@@ -408,6 +408,26 @@ __global__ void sw_scan(int midpoint, int payload_len,
                         const int *__restrict__ thresholds, int threshold_lit,
                         bool exit_first, Report *report)
 {
+    // Optional compile-time pinning, to reproduce the old programs' fully
+    // hard-coded builds for A/B comparison: -DPIN_SIGNATURES=10000000
+    // -DPIN_PAYLOAD=512 -DPIN_THRESHOLD=12 -DPIN_EXIT_FIRST=1 turns these
+    // parameters into constants the compiler can optimize against, exactly
+    // as the old sources' #defines did. The host refuses flags that
+    // contradict a pin, so a pinned binary cannot measure the wrong
+    // configuration. An unpinned build is unaffected.
+#ifdef PIN_SIGNATURES
+    midpoint = (int)((long long)PIN_SIGNATURES / 2);
+#endif
+#ifdef PIN_PAYLOAD
+    payload_len = PIN_PAYLOAD;
+#endif
+#ifdef PIN_THRESHOLD
+    threshold_lit = PIN_THRESHOLD;
+#endif
+#ifdef PIN_EXIT_FIRST
+    exit_first = (PIN_EXIT_FIRST != 0);
+#endif
+
     const int gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= midpoint) return;
 
@@ -900,6 +920,36 @@ int main(int argc, char **argv)
                                             L, alpha);
     }
 
+    // A pinned binary refuses a run whose settings differ from its pins, so
+    // it cannot silently measure the wrong configuration.
+#ifdef PIN_SIGNATURES
+    if (N != (long long)PIN_SIGNATURES) {
+        fprintf(stderr, "This binary is pinned to --signatures %lld\n",
+                (long long)PIN_SIGNATURES);
+        return 1;
+    }
+#endif
+#ifdef PIN_PAYLOAD
+    if (P != PIN_PAYLOAD) {
+        fprintf(stderr, "This binary is pinned to --payload %d\n", PIN_PAYLOAD);
+        return 1;
+    }
+#endif
+#ifdef PIN_THRESHOLD
+    if (regex_mode || threshold_lit != PIN_THRESHOLD) {
+        fprintf(stderr, "This binary is pinned to literal mode with threshold"
+                        " %d\n", PIN_THRESHOLD);
+        return 1;
+    }
+#endif
+#ifdef PIN_EXIT_FIRST
+    if (exit_first != (PIN_EXIT_FIRST != 0)) {
+        fprintf(stderr, "This binary is pinned to --exit %s\n",
+                PIN_EXIT_FIRST ? "first" : "never");
+        return 1;
+    }
+#endif
+
     // The threshold the verifier applies to signature k.
     #define THR_OF(k) (regex_mode ? thresholds[k] : threshold_lit)
 
@@ -969,6 +1019,11 @@ int main(int argc, char **argv)
     // ------------------------------------------------------------------
 
     printf("# program           : smith_waterman_dpi\n");
+#if defined(PIN_SIGNATURES) || defined(PIN_PAYLOAD) || \
+    defined(PIN_THRESHOLD) || defined(PIN_EXIT_FIRST)
+    printf("# pinned            : compile-time constants baked into the"
+           " kernel\n");
+#endif
     printf("# signatures        : %lld\n", N);
     printf("# payload_bytes     : %d\n", P);
     printf("# sig_len           : %d\n", L);
