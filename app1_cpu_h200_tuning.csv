@@ -1,0 +1,13 @@
+nodes,target,gpu,layout,dpx,store,sync,block_threads,grid_blocks,trial,kernel_s,endtoend_s,energy_j,mean_power_w,power_samples,mismatches
+1000,cpu,openmp-16,n/a,n/a,n/a,n/a,0,0,1,0.006049,0.006049,,,0,0
+1000,cpu,openmp-16,n/a,n/a,n/a,n/a,0,0,2,0.005998,0.005998,,,0,0
+1000,cpu,openmp-16,n/a,n/a,n/a,n/a,0,0,3,0.006035,0.006035,,,0,0
+3000,cpu,openmp-16,n/a,n/a,n/a,n/a,0,0,1,0.075372,0.075372,,,0,0
+3000,cpu,openmp-16,n/a,n/a,n/a,n/a,0,0,2,0.075446,0.075446,,,0,0
+3000,cpu,openmp-16,n/a,n/a,n/a,n/a,0,0,3,0.075318,0.075318,,,0,0
+1000,cpu,openmp-32,n/a,n/a,n/a,n/a,0,0,1,0.008551,0.008551,,,0,0
+1000,cpu,openmp-32,n/a,n/a,n/a,n/a,0,0,2,0.008281,0.008281,,,0,0
+1000,cpu,openmp-32,n/a,n/a,n/a,n/a,0,0,3,0.008408,0.008408,,,0,0
+3000,cpu,openmp-32,n/a,n/a,n/a,n/a,0,0,1,0.213857,0.213857,,,0,0
+3000,cpu,openmp-32,n/a,n/a,n/a,n/a,0,0,2,0.053088,0.053088,,,0,0
+3000,cpu,openmp-32,n/a,n/a,n/a,n/a,0,0,3,0.053115,0.053115,,,0,0
