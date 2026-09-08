@@ -46,6 +46,18 @@ LOG=$(mktemp -d "${TMPDIR:-/tmp}/energy-$TAG.XXXXXX")
 echo "Tag $TAG, arch $ARCHES, logs in $LOG"
 echo
 
+# A csv written before the programs gained a column cannot be appended to: the
+# new rows would carry one more field than its header describes, and nothing
+# downstream would notice. Refuse rather than corrupt the file.
+for f in app1_energy_$TAG.csv app2_energy_$TAG.csv; do
+    if [ -f "$f" ] && ! head -1 "$f" | grep -q energy_counter_j; then
+        echo "$f was written before the energy_counter_j column existed." >&2
+        echo "Appending to it would misalign every new row against its header." >&2
+        echo "Remove it and let this run write it afresh:  rm $f" >&2
+        exit 1
+    fi
+done
+
 # ---------------------------------------------------------------------------
 echo "=============================================================="
 echo "1. Build"
