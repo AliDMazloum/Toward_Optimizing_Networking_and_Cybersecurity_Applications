@@ -862,6 +862,54 @@ static double stddev_of(const double *v, int n, double mean)
 }
 
 // ---------------------------------------------------------------------------
+// Results file
+// ---------------------------------------------------------------------------
+// A results csv is appended to across many runs, and a binary built from a
+// different commit writes a different set of columns. Appending under a header
+// that describes the older set leaves every later reader one field out of step,
+// and nothing reports it, because a csv carries no statement of how many
+// columns a row should have: the file still parses, and the numbers land under
+// the wrong names. The header that would be written is therefore compared with
+// the one already in the file, and a run stops before it starts rather than
+// after the work is done.
+
+static const char CSV_HEADER[] =
+    "nodes,topology,target,gpu,layout,dpx,store,sync,"
+    "block_threads,grid_blocks,trial,kernel_s,"
+    "endtoend_s,energy_j,"
+    "mean_power_w,power_samples,energy_counter_j,"
+    "mismatches\n";
+
+// True when the file is absent or empty, because the run then writes the header
+// itself, and when the header it already holds is the one this program writes.
+static bool csv_header_matches(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return true;
+    char line[512];
+    const char *got = fgets(line, sizeof line, f);
+    fclose(f);
+    if (got == NULL) return true;
+
+    char want[512];
+    snprintf(want, sizeof want, "%s", CSV_HEADER);
+    line[strcspn(line, "\r\n")] = '\0';
+    want[strcspn(want, "\r\n")] = '\0';
+    if (strcmp(line, want) == 0) return true;
+
+    fprintf(stderr, "\nThe csv already exists and its header is not the one this"
+                    " program writes,\nso appending to it would put every new row"
+                    " out of step with the header\nthat is supposed to describe"
+                    " it.\n");
+    fprintf(stderr, "  file     : %s\n", path);
+    fprintf(stderr, "  it has   : %s\n", line);
+    fprintf(stderr, "  we write : %s\n", want);
+    fprintf(stderr, "Point --csv at a new file, or move this one aside and let"
+                    " the run recreate it.\n");
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Command line
 // ---------------------------------------------------------------------------
 
@@ -1000,6 +1048,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "--attach must be at least 1 and below --nodes\n");
         return 1;
     }
+    // Checked here, with the rest of the settings, so that a mismatch costs
+    // nothing: the run has not started and no measurement is lost.
+    if (csv_path != NULL && !csv_header_matches(csv_path)) return 1;
 
     int *edge_u = NULL, *edge_v = NULL;
     long long n_edges = 0;
@@ -1241,12 +1292,7 @@ int main(int argc, char **argv)
                 perror("csv");
             } else {
                 fseek(f, 0, SEEK_END);
-                if (ftell(f) == 0)
-                    fprintf(f, "nodes,topology,target,gpu,layout,dpx,store,sync,"
-                               "block_threads,grid_blocks,trial,kernel_s,"
-                               "endtoend_s,energy_j,"
-                               "mean_power_w,power_samples,energy_counter_j,"
-                               "mismatches\n");
+                if (ftell(f) == 0) fputs(CSV_HEADER, f);
                 fprintf(f, "%d,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%.6f,%.6f,",
                         V, topology_name(topo), run_cpu ? "cpu" : "gpu",
                         run_cpu ? cpu_desc() : prop.name,

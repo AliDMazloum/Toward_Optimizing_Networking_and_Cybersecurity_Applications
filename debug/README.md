@@ -53,3 +53,32 @@ the workstation before any of the numbers are quoted.
 Sweeps append, and the analysis keeps the last five trials of each
 configuration, so re-running after an interruption neither duplicates work nor
 repeats a configuration that already finished.
+
+## check_csv_guard.sh
+
+Exercises the header guard in both programs. A results csv is appended to
+across many runs, and a binary built from a different commit writes a different
+set of columns; appending under a header that describes the older set leaves
+every reader one field out of step, and nothing reports it, because a csv
+carries no statement of how many columns a row should have. The file still
+parses and the numbers land under the wrong names. Both programs now compare
+the header they would write against the one already in the file and stop before
+the run rather than after the work is done.
+
+That guard is cheap to get wrong in ways a build does not catch, so it is
+tested rather than assumed: a constant matching nothing would refuse every
+append from now on, and one matching too loosely would let the original problem
+back in.
+
+    ./debug/check_csv_guard.sh App1/floyd_warshall_routing-a100 --cpu --nodes 200
+    ./debug/check_csv_guard.sh App2/smith_waterman_dpi-a100 --cpu --signatures 2000
+
+Build with whichever invocation that machine uses (`make a100-app1`,
+`make h200-app2`, or a `TAG=` of its own) and give the script the binary it
+produced. The cases run on the CPU path, so any build works and no GPU is
+needed. Give it the smallest configuration the program accepts, because the
+point is the csv rather than the measurement. It checks three cases: a file that does
+not exist is created with its header, a file carrying the right header is
+appended to, and a file whose header is one column short is refused with the
+file left byte for byte unchanged. It works inside a temporary directory and
+touches nothing else.
