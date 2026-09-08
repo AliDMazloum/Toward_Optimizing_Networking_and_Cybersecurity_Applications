@@ -211,7 +211,7 @@ readable.
 | `--store <policy>` | `always` writes every cell on every pass. `changed` writes only the cells whose value improves, which removes most of the write traffic and is what the originally published kernel did. With `--dpx on` the two policies use different instructions, `__viaddmin_s32` and `__vibmin_s32` respectively, because only the second returns the comparison alongside the minimum. Default `always`. |
 | `--trials <int>` | Measured repetitions. Default 1. |
 | `--warmup <int>` | Unmeasured repetitions run first. Default 1. |
-| `--cpu` | Run the serial host reference instead of the GPU. |
+| `--cpu` | Run the host reference instead of the GPU. It is the textbook triple loop, spread across OpenMP threads when the build enables OpenMP and serial when it does not. |
 | `--energy` | Sample GPU power with NVML and report energy per trial. |
 | `--poll-ms <int>` | NVML sampling interval in milliseconds. Default 1. |
 | `--device <int>` | CUDA and NVML device index. Default 0. |

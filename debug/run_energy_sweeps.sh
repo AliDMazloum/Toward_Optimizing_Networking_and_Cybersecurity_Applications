@@ -41,6 +41,19 @@ esac
 APP1=App1/floyd_warshall_routing-$TAG
 APP2=App2/smith_waterman_dpi-$TAG
 CHECK_NODES=${CHECK_NODES:-24000}
+
+# How long the App2 timed window must be before the two energy instruments
+# agree. Both cards refresh their sampled power and step their energy counter
+# about every 100 ms, so a window of twenty steps holds the quantisation near
+# five percent, which is the bound the analysis applies. Two seconds is that
+# twenty steps. It is not a per-machine constant and it is not the run length:
+# the program divides every reported figure back down to one scan, and writes
+# the number of scans it did into the repeat column.
+#
+# App1 cannot use this. Floyd-Warshall converges its matrix in place, so a
+# second pass over the same matrix is not the same work, and restoring the
+# matrix would put the copy inside the timed window.
+MIN_WINDOW=${MIN_WINDOW:-2.0}
 LOG=$(mktemp -d "${TMPDIR:-/tmp}/energy-$TAG.XXXXXX")
 
 echo "Tag $TAG, arch $ARCHES, logs in $LOG"
@@ -80,9 +93,10 @@ echo "--------------------------------------------------------------"
 grep -E "busiest GPU during the run|mean interval between consecutive changes|program reported" \
     "$LOG/power_check.log" || echo "  (not found; read $LOG/power_check.log in full)"
 echo
-echo "Feed the refresh interval into GPU_POWER_REFRESH_S in validate_energy.py"
-echo "before judging which of this machine's energy points are reportable. The"
-echo "value there was measured on the A100 and does not carry over."
+echo "Add the refresh interval to GPU_POWER_REFRESH_BY_CARD in validate_energy.py,"
+echo "keyed on this card's name, before judging which of its energy points are"
+echo "reportable. The intervals there were measured per card and none carries"
+echo "over to another."
 echo
 
 if [ "$MODE" = "--check-only" ]; then
@@ -105,8 +119,8 @@ echo "=============================================================="
 echo "4. App2 energy sweep"
 echo "=============================================================="
 make ARCHES=$ARCHES TAG=$TAG GPU_MATCH=$GPU_MATCH sweep2 \
-    SWEEP2_FLAGS="--mode literal --rows registers --energy" \
-    SWEEP2_CSV=Results/app2_energy_$TAG.csv 2>&1 | tee "$LOG/app2_sweep.log"
+    SWEEP2_FLAGS="--mode literal --rows registers --energy --min-window $MIN_WINDOW" \
+    SWEEP2_CSV=Results/app2_energy_repeat_$TAG.csv 2>&1 | tee "$LOG/app2_sweep.log"
 APP2_STATUS=${PIPESTATUS[0]}
 echo
 
@@ -114,7 +128,7 @@ echo
 echo "=============================================================="
 echo "5. What happened"
 echo "=============================================================="
-for f in Results/app1_energy_$TAG.csv Results/app2_energy_$TAG.csv; do
+for f in Results/app1_energy_$TAG.csv Results/app2_energy_repeat_$TAG.csv; do
     if [ -f "$f" ]; then
         rows=$(($(wc -l < "$f") - 1))
         bad=$(awk -F, 'NR==1 { for(i=1;i<=NF;i++) if($i=="mismatches") c=i; next }

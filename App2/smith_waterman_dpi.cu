@@ -789,7 +789,7 @@ static double stddev_of(const double *v, int n, double mean)
 static const char CSV_HEADER[] =
     "signatures,payload,sig_len,mode,rows,dpx,alpha,"
     "block_threads,grid_blocks,exit,plant,seed,"
-    "target,gpu,trial,kernel_s,endtoend_s,energy_j,"
+    "target,gpu,repeat,trial,kernel_s,endtoend_s,energy_j,"
     "mean_power_w,power_samples,energy_counter_j,"
     "found,report_sig,"
     "report_score,report_pos,mismatches\n";
@@ -853,6 +853,13 @@ static void print_usage(const char *prog)
     printf("                      (default: none, nothing matches)\n");
     printf("  --trials <int>      measured repetitions (default 1)\n");
     printf("  --warmup <int>      unmeasured repetitions first (default 1)\n");
+    printf("  --repeat <int>      scans inside one timed window (default 1).\n");
+    printf("                      Raise it when a scan finishes faster than\n");
+    printf("                      the energy instruments resolve; every\n");
+    printf("                      reported figure is still per scan.\n");
+    printf("  --min-window <sec>  choose --repeat from the warm-up scan, so\n");
+    printf("                      the window reaches this length (default 0,\n");
+    printf("                      off). Needs at least one warm-up.\n");
     printf("  --cpu               run the host reference instead of the GPU\n");
     printf("                      (OpenMP when the build enables it, else serial)\n");
     printf("  --energy            report per-trial energy: NVML power sampling\n");
@@ -881,7 +888,9 @@ int main(int argc, char **argv)
     bool  exit_first = true;
     long long plant  = -1;
     int   trials     = 1;
-    int   warmup     = 1;
+    int    warmup       = 1;
+    int    repeat       = 1;
+    double min_window_s = 0.0;
     bool  run_cpu    = false;
     bool  measure_energy = false;
     long  poll_ms    = 1;
@@ -929,6 +938,10 @@ int main(int argc, char **argv)
             plant = atoll(argv[++i]);
         } else if (!strcmp(argv[i], "--trials") && i + 1 < argc) {
             trials = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--repeat") && i + 1 < argc) {
+            repeat = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--min-window") && i + 1 < argc) {
+            min_window_s = atof(argv[++i]);
         } else if (!strcmp(argv[i], "--warmup") && i + 1 < argc) {
             warmup = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--cpu")) {
@@ -987,6 +1000,37 @@ int main(int argc, char **argv)
     }
     if (trials < 1) { fprintf(stderr, "--trials must be at least 1\n"); return 1; }
     if (warmup < 0) { fprintf(stderr, "--warmup cannot be negative\n"); return 1; }
+    if (repeat < 1) { fprintf(stderr, "--repeat must be at least 1\n"); return 1; }
+    if (min_window_s < 0.0) {
+        fprintf(stderr, "--min-window cannot be negative\n");
+        return 1;
+    }
+    if (min_window_s > 0.0 && warmup < 1) {
+        fprintf(stderr, "--min-window needs at least one warm-up: the repeat"
+                        " count is read off\nthe warm-up scan rather than"
+                        " guessed.\n");
+        return 1;
+    }
+    // Repeating inside the window is only the same work repeated when each
+    // launch starts from the state the one before it started from. With the DP
+    // rows in registers every launch zeroes its own, so it does. With the rows
+    // in global memory a launch reads what the previous one left behind, and
+    // the memset that clears them sits outside the timed window where it
+    // belongs, so the second scan onward would not be the scan being measured.
+    if ((repeat > 1 || min_window_s > 0.0) && !rows_reg) {
+        fprintf(stderr, "--repeat above 1 needs --rows registers: with the rows"
+                        " in global memory\neach scan would read what the one"
+                        " before it left behind.\n");
+        return 1;
+    }
+    // The CPU path reads its counters at the edges of the window, so it has no
+    // shortest usable run and nothing to gain here.
+    if ((repeat > 1 || min_window_s > 0.0) && run_cpu) {
+        fprintf(stderr, "--repeat above 1 does not apply to --cpu: RAPL is read"
+                        " at the window\nedges and resolves a run of any"
+                        " length.\n");
+        return 1;
+    }
     // Checked here, with the rest of the settings, so that a mismatch costs
     // nothing: the run has not started and no measurement is lost.
     if (csv_path != NULL && !csv_header_matches(csv_path)) return 1;
@@ -1207,6 +1251,13 @@ int main(int argc, char **argv)
     printf("# seed              : %u\n", seed);
     printf("# trials            : %d\n", trials);
     printf("# warmup            : %d (not reported)\n", warmup);
+    if (min_window_s > 0.0)
+        printf("# repeat            : chosen after the warm-up, to fill"
+               " %.3f s\n", min_window_s);
+    else
+        printf("# repeat            : %d scan%s per timed window%s\n",
+               repeat, repeat == 1 ? "" : "s",
+               repeat == 1 ? "" : "; every figure below is per scan");
     printf("# verify            : %s\n",
            verify == VERIFY_OFF ? "off" :
            verify == VERIFY_REPORT ? "the reported signature, on the host"
@@ -1332,12 +1383,20 @@ int main(int argc, char **argv)
             CUDA_CHECK(cudaMemcpyToSymbol(c_payload, payload, (size_t)P));
 
             CUDA_CHECK(cudaEventRecord(ev_start, 0));
-            if (L == SIG_LEN_A)
-                launch_sig_len<SIG_LEN_A>(use_dpx, rows_reg, regex_mode,
-                                          grid, block, &args);
-            else
-                launch_sig_len<SIG_LEN_B>(use_dpx, rows_reg, regex_mode,
-                                          grid, block, &args);
+            // The scan does not modify its inputs and, with the rows held in
+            // registers, each launch zeroes its own state, so running it
+            // repeatedly inside one window is the same work done repeatedly.
+            // That is the point: a scan too short for the energy instruments
+            // to resolve becomes a window they can, and the per-scan figures
+            // below divide back out. The repeat count is 1 unless asked for.
+            for (int rep_i = 0; rep_i < repeat; rep_i++) {
+                if (L == SIG_LEN_A)
+                    launch_sig_len<SIG_LEN_A>(use_dpx, rows_reg, regex_mode,
+                                              grid, block, &args);
+                else
+                    launch_sig_len<SIG_LEN_B>(use_dpx, rows_reg, regex_mode,
+                                              grid, block, &args);
+            }
             CUDA_CHECK(cudaPeekAtLastError());
             CUDA_CHECK(cudaEventRecord(ev_stop, 0));
             CUDA_CHECK(cudaEventSynchronize(ev_stop));
@@ -1370,21 +1429,44 @@ int main(int argc, char **argv)
                 (rep.claimed != 0) != (host_crossers > 0)) bad++;
         }
 
+        // The repeat count is read off the last warm-up rather than chosen: it
+        // is whatever this card, at this size, needs to fill the requested
+        // window. A scan already long enough keeps a count of one. Doing it
+        // here means every measured trial uses the same count, and the count
+        // itself is never a number somebody typed.
+        if (!measured && t == -1 && min_window_s > 0.0) {
+            const double one = kernel_seconds / (double)repeat;
+            if (one > 0.0 && one * repeat < min_window_s) {
+                repeat = (int)ceil(min_window_s / one);
+                printf("# repeat            : %d, to fill %.3f s from a warm-up"
+                       " scan of %.6f s\n", repeat, min_window_s, one);
+                fflush(stdout);
+            }
+        }
+
         if (!measured) continue;
 
-        kernel_s[t]   = kernel_seconds;
-        endtoend_s[t] = t1 - t0;
+        // Everything below is per scan, so a repeated window reports the same
+        // quantities a single scan would and stays comparable with every row
+        // ever written. Power is not divided: it is a rate, and the rate over
+        // the window is what the device drew. The repeat column records how
+        // many scans the window held, so its length is recoverable.
+        const double per = (double)repeat;
+        kernel_s[t]   = kernel_seconds / per;
+        endtoend_s[t] = (t1 - t0) / per;
 
         int nsamp = 0;
-        if (measure_energy && !run_cpu)
+        if (measure_energy && !run_cpu) {
             energy_ok[t] = power_window(t0, t1, &energy_j[t], &power_w[t], &nsamp);
+            if (energy_ok[t]) energy_j[t] /= per;
+        }
         if (measure_energy && run_cpu) {
-            energy_j[t]  = trial_joules;
+            energy_j[t]  = trial_joules / per;
             power_w[t]   = trial_joules / (t1 - t0);
             energy_ok[t] = true;
         }
         if (ctr_ok) {
-            energy_ctr_j[t]  = (double)(ctr1 - ctr0) / 1000.0;
+            energy_ctr_j[t]  = (double)(ctr1 - ctr0) / 1000.0 / per;
             energy_ctr_ok[t] = true;
         }
 
@@ -1408,7 +1490,7 @@ int main(int argc, char **argv)
             } else {
                 fseek(f, 0, SEEK_END);
                 if (ftell(f) == 0) fputs(CSV_HEADER, f);
-                fprintf(f, "%lld,%d,%d,%s,%s,%s,%g,%d,%d,%s,%lld,%u,%s,%s,%d,"
+                fprintf(f, "%lld,%d,%d,%s,%s,%s,%g,%d,%d,%s,%lld,%u,%s,%s,%d,%d,"
                            "%.6f,%.6f,",
                         N, P, L, regex_mode ? "regex" : "literal",
                         run_cpu ? "n/a" : (rows_reg ? "registers" : "global"),
@@ -1417,7 +1499,7 @@ int main(int argc, char **argv)
                         exit_first ? "first" : "never", plant, seed,
                         run_cpu ? "cpu" : "gpu",
                         run_cpu ? cpu_desc() : prop.name,
-                        t + 1, kernel_s[t], endtoend_s[t]);
+                        repeat, t + 1, kernel_s[t], endtoend_s[t]);
                 if (measure_energy && energy_ok[t])
                     fprintf(f, "%.3f,%.3f,%d,", energy_j[t], power_w[t], nsamp);
                 else
