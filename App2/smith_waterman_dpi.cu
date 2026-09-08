@@ -547,18 +547,24 @@ static bool host_scan_signature(bool regex_mode, const char *payload, int P,
 //
 // The kernel's powercap interface counts package energy in microjoules at
 // /sys/class/powercap/intel-rapl:<n>/energy_uj (the name is historical; the
-// same driver serves AMD packages). A reading brackets exactly the code
-// between begin and end, so no sampling thread is involved. Each counter
-// wraps at its max_energy_range_uj; the reader unwraps per package and sums
-// the packages. Package energy covers everything on the socket, not just
-// this process. rapl_zones() returning 0 means the counters are absent or
-// not readable here.
+// same driver serves AMD packages). Each counter wraps at its
+// max_energy_range_uj, and a wrap shows up only as a decrease, so bracketing a
+// long run with one read at each end loses a whole range per wrap without any
+// sign that it happened. A poller therefore reads the counters ten times a
+// second and accumulates the unwrapped differences, which keeps every interval
+// several orders of magnitude below one range. Package energy covers
+// everything on the socket, not just this process. rapl_zones() returning 0
+// means the counters are absent or not readable here.
 // ---------------------------------------------------------------------------
 
 #define RAPL_MAX_PKGS 8
-static int       g_rapl_pkgs = 0;
-static long long g_rapl_range[RAPL_MAX_PKGS];
-static long long g_rapl_before[RAPL_MAX_PKGS];
+#define RAPL_POLL_MS  100
+static int           g_rapl_pkgs = 0;
+static long long     g_rapl_range[RAPL_MAX_PKGS];
+static long long     g_rapl_last[RAPL_MAX_PKGS];
+static long long     g_rapl_total_uj = 0;
+static volatile bool g_rapl_running = false;
+static pthread_t     g_rapl_thread;
 
 static bool rapl_read_pkg(int i, const char *file, long long *out)
 {
@@ -584,24 +590,54 @@ static int rapl_zones(void)
     return g_rapl_pkgs;
 }
 
+// Adds the microjoules each package consumed since it was last read.
+static void rapl_accumulate(void)
+{
+    for (int i = 0; i < g_rapl_pkgs; i++) {
+        long long now = g_rapl_last[i];
+        if (!rapl_read_pkg(i, "energy_uj", &now)) continue;
+        long long d = now - g_rapl_last[i];
+        if (d < 0) d += g_rapl_range[i];
+        g_rapl_total_uj += d;
+        g_rapl_last[i] = now;
+    }
+}
+
+static void *rapl_polling_func(void *unused)
+{
+    (void)unused;
+    while (g_rapl_running) {
+        struct timespec ts;
+        ts.tv_sec  = RAPL_POLL_MS / 1000;
+        ts.tv_nsec = (RAPL_POLL_MS % 1000) * 1000000L;
+        nanosleep(&ts, NULL);
+        rapl_accumulate();
+    }
+    return NULL;
+}
+
 static void rapl_begin(void)
 {
     for (int i = 0; i < g_rapl_pkgs; i++)
-        rapl_read_pkg(i, "energy_uj", &g_rapl_before[i]);
+        rapl_read_pkg(i, "energy_uj", &g_rapl_last[i]);
+    g_rapl_total_uj = 0;
+    g_rapl_running = true;
+    if (pthread_create(&g_rapl_thread, NULL, rapl_polling_func, NULL) != 0) {
+        fprintf(stderr, "Could not start the RAPL polling thread\n");
+        exit(EXIT_FAILURE);
+    }
 }
 
-// Joules over all packages since rapl_begin, unwrapped per package.
+// Joules over all packages since rapl_begin, unwrapped per package. The poller
+// is stopped and joined first, so the final accumulate races with nothing.
 static double rapl_end_joules(void)
 {
-    long long total_uj = 0;
-    for (int i = 0; i < g_rapl_pkgs; i++) {
-        long long after = g_rapl_before[i];
-        rapl_read_pkg(i, "energy_uj", &after);
-        long long d = after - g_rapl_before[i];
-        if (d < 0) d += g_rapl_range[i];
-        total_uj += d;
+    if (g_rapl_running) {
+        g_rapl_running = false;
+        pthread_join(g_rapl_thread, NULL);
     }
-    return (double)total_uj / 1e6;
+    rapl_accumulate();
+    return (double)g_rapl_total_uj / 1e6;
 }
 
 // Names how the host path runs, for the header and the csv: the OpenMP
