@@ -68,8 +68,12 @@ make h200-clean   # remove this machine's binaries and nothing else
 and the same six with `a100`. `make h200` produces `App1/floyd_warshall_routing-h200`, `make a100`
 produces `App1/floyd_warshall_routing-a100`, and both can be built and measured at the same time.
 
-`h200-sweep` writes `app1_final_h200.csv` and `a100-sweep` writes `app1_final_a100.csv`, so the two
-machines never append to one file. Before running anything, a sweep asks the node which GPU it has
+Sweeps write into `Results/`, which is also where the measurements behind the paper live.
+`h200-sweep` writes `Results/app1_final_h200.csv` and `a100-sweep` writes
+`Results/app1_final_a100.csv`, so the two machines never append to one file. A program also refuses
+to append to a file whose header is not the one it writes, which stops a binary built from an older
+revision from adding rows that its header no longer describes.
+Before running anything, a sweep asks the node which GPU it has
 and refuses if the answer does not match the target's name, which catches a job that landed on the
 wrong machine before it produces a mislabelled number. `SWEEP_NODES`, `SWEEP_TRIALS`, `SWEEP_WARMUP`,
 `SWEEP_FLAGS` and `SWEEP_CSV` override what it runs and where it writes.
@@ -188,11 +192,11 @@ The routing program takes every parameter on the command line, so a sweep needs 
 rebuilds:
 
 ```bash
-./App1/floyd_warshall_routing-h200 --nodes 24000 --layout coalesced --dpx on --trials 10 --warmup 1 --energy --csv results_h200.csv
+./App1/floyd_warshall_routing-h200 --nodes 24000 --layout coalesced --dpx on --trials 10 --warmup 1 --energy --csv Results/my_run_h200.csv
 ```
 
 The sweep reported in the paper is `make h200-sweep` or `make a100-sweep`, which fills these flags
-in for you and writes one file per machine.
+in for you and writes one file per machine under `Results/`.
 
 If you call the program directly, give each machine its own `--csv` file. Two runs appending to one
 file on a shared file system interleave their rows and can tear a line. Every row records the GPU it
@@ -211,7 +215,7 @@ readable.
 | `--energy` | Sample GPU power with NVML and report energy per trial. |
 | `--poll-ms <int>` | NVML sampling interval in milliseconds. Default 1. |
 | `--device <int>` | CUDA and NVML device index. Default 0. |
-| `--csv <path>` | Append one row per trial, with every setting, to this file. |
+| `--csv <path>` | Append one row per trial, with every setting, to this file. A file whose header is not the one this build writes is refused, so rows never land under a header that does not describe them. |
 | `--power-csv <path>` | Write every power sample to this file. |
 | `--no-verify` | Skip the correctness check. |
 

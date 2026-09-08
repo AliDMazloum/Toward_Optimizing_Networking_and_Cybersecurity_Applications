@@ -86,13 +86,14 @@ CHECK_NODES      ?= 1000
 CHECK_SIGNATURES ?= 10000
 CHECK_PLANT      ?= 1356
 
-# The reported App1 sweep. Each machine writes its own file, because two
-# processes appending to one file on a shared mount interleave their rows.
+# The reported App1 sweep. Results land in Results/, and each machine writes its
+# own file there, because two processes appending to one file on a shared mount
+# interleave their rows.
 SWEEP_NODES  ?= 1000 2000 3000 6000 12000 24000
 SWEEP_TRIALS ?= 5
 SWEEP_WARMUP ?= 1
 SWEEP_FLAGS  ?= --layout coalesced --store changed --sync per-launch
-SWEEP_CSV    ?= app1_final_$(TAG).csv
+SWEEP_CSV    ?= Results/app1_final_$(TAG).csv
 
 # The reported App2 sweep: both configurations (payload, signature length),
 # the full range of signature counts, DPX on and off. Trials and warm-up
@@ -102,7 +103,7 @@ SWEEP2_SIGS    ?= 10000 100000 1000000 10000000 20000000 30000000 40000000 50000
 SWEEP2_TRIALS  ?= 5
 SWEEP2_WARMUP  ?= 1
 SWEEP2_FLAGS   ?= --mode literal --rows registers
-SWEEP2_CSV     ?= app2_final_$(TAG).csv
+SWEEP2_CSV     ?= Results/app2_final_$(TAG).csv
 
 # Substring the node's GPU name must contain before a sweep runs. The machine
 # targets set it; set it to nothing to skip the check.
@@ -168,6 +169,7 @@ sweep: $(APP1_TARGETS)
 	       exit 1 ;; \
 	  esac; \
 	fi; \
+	mkdir -p $(dir $(SWEEP_CSV)) || exit 1; \
 	echo "# writing $(SWEEP_CSV)"; \
 	for n in $(SWEEP_NODES); do \
 	  for d in on off; do \
@@ -192,6 +194,7 @@ sweep2: $(APP2_TARGETS)
 	       exit 1 ;; \
 	  esac; \
 	fi; \
+	mkdir -p $(dir $(SWEEP2_CSV)) || exit 1; \
 	echo "# writing $(SWEEP2_CSV)"; \
 	for cfg in $(SWEEP2_CONFIGS); do \
 	  pay=$${cfg%x*}; len=$${cfg#*x}; \

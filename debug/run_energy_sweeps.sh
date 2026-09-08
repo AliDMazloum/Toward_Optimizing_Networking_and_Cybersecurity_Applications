@@ -96,7 +96,7 @@ echo "3. App1 energy sweep"
 echo "=============================================================="
 make ARCHES=$ARCHES TAG=$TAG GPU_MATCH=$GPU_MATCH sweep \
     SWEEP_FLAGS="--layout tiled --store changed --sync per-launch --energy" \
-    SWEEP_CSV=app1_energy_$TAG.csv 2>&1 | tee "$LOG/app1_sweep.log"
+    SWEEP_CSV=Results/app1_energy_$TAG.csv 2>&1 | tee "$LOG/app1_sweep.log"
 APP1_STATUS=${PIPESTATUS[0]}
 echo
 
@@ -106,7 +106,7 @@ echo "4. App2 energy sweep"
 echo "=============================================================="
 make ARCHES=$ARCHES TAG=$TAG GPU_MATCH=$GPU_MATCH sweep2 \
     SWEEP2_FLAGS="--mode literal --rows registers --energy" \
-    SWEEP2_CSV=app2_energy_$TAG.csv 2>&1 | tee "$LOG/app2_sweep.log"
+    SWEEP2_CSV=Results/app2_energy_$TAG.csv 2>&1 | tee "$LOG/app2_sweep.log"
 APP2_STATUS=${PIPESTATUS[0]}
 echo
 
@@ -114,7 +114,7 @@ echo
 echo "=============================================================="
 echo "5. What happened"
 echo "=============================================================="
-for f in app1_energy_$TAG.csv app2_energy_$TAG.csv; do
+for f in Results/app1_energy_$TAG.csv Results/app2_energy_$TAG.csv; do
     if [ -f "$f" ]; then
         rows=$(($(wc -l < "$f") - 1))
         bad=$(awk -F, 'NR==1 { for(i=1;i<=NF;i++) if($i=="mismatches") c=i; next }
@@ -135,8 +135,8 @@ if [ "$APP1_STATUS" -ne 0 ] || [ "$APP2_STATUS" -ne 0 ]; then
     echo "  repeat the configurations that already finished."
 fi
 echo
-echo "  Commit the CSVs, then on the workstation: copy them into Results/,"
-echo "  rerun build_results_workbook.py, and rerun validate_energy.py with this"
-echo "  machine's refresh interval before quoting any of it."
+echo "  Commit the CSVs from Results/, then on the workstation rerun"
+echo "  build_results_workbook.py and validate_energy.py, the latter with this"
+echo "  machine's refresh interval, before quoting any of it."
 echo
 echo "Logs are in $LOG."
