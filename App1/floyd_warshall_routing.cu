@@ -161,23 +161,25 @@ static void *power_polling_func(void *unused)
     return NULL;
 }
 
-static void power_start(unsigned int device_index, long interval_ms)
+// A CUDA device index and an NVML device index are not the same name for the
+// same card. CUDA_VISIBLE_DEVICES renumbers what CUDA can see and NVML ignores
+// that mask, so handing one index to both libraries can leave the sampler
+// watching a card that is running nothing. The PCI bus id is the one identifier
+// both agree on, so the handle is resolved through it and printed, which makes
+// a mismatch visible in the run header instead of silent in the numbers.
+static void power_start(int cuda_device, long interval_ms)
 {
-    unsigned int device_count = 0;
+    char pci_id[32];
     char name[NVML_DEVICE_NAME_BUFFER_SIZE];
 
+    CUDA_CHECK(cudaDeviceGetPCIBusId(pci_id, (int)sizeof pci_id, cuda_device));
+
     nvml_check(nvmlInit(), "nvmlInit");
-    nvml_check(nvmlDeviceGetCount(&device_count), "nvmlDeviceGetCount");
-    if (device_index >= device_count) {
-        fprintf(stderr, "NVML device index %u is out of range, %u present\n",
-                device_index, device_count);
-        exit(EXIT_FAILURE);
-    }
-    nvml_check(nvmlDeviceGetHandleByIndex(device_index, &g_nvml_device),
-               "nvmlDeviceGetHandleByIndex");
+    nvml_check(nvmlDeviceGetHandleByPciBusId(pci_id, &g_nvml_device),
+               "nvmlDeviceGetHandleByPciBusId");
     nvml_check(nvmlDeviceGetName(g_nvml_device, name, sizeof(name)),
                "nvmlDeviceGetName");
-    printf("# nvml_device        : %s (index %u)\n", name, device_index);
+    printf("# nvml_device        : %s at %s\n", name, pci_id);
 
     g_poll_interval_ms = interval_ms;
     g_poll_running = true;
@@ -1080,7 +1082,7 @@ int main(int argc, char **argv)
 
     if (measure_energy && !run_cpu) {
         printf("# poll_interval_ms  : %ld\n", poll_ms);
-        power_start((unsigned int)device, poll_ms);
+        power_start(device, poll_ms);
         // Let the sampler produce a first reading before any trial starts.
         struct timespec settle = { 0, 100 * 1000000L };
         nanosleep(&settle, NULL);

@@ -85,7 +85,7 @@ kill $IDLE_PID 2>/dev/null
 wait $IDLE_PID 2>/dev/null
 
 awk -F', *' '{ n[$1]++; p[$1]+=$2; if($3>u[$1]) u[$1]=$3 }
-     END { for (i in n) printf "  GPU %s: idle mean %.1f W, peak utilisation %s%%, %d samples\n", i, p[i]/n[i], u[i], n[i] }' \
+     END { for (i in n) printf "  GPU %s: idle mean %.1f W, peak utilisation %d%%, %d samples\n", i, p[i]/n[i], u[i]+0, n[i] }' \
      "$OUT/idle.log" | sort
 echo
 
@@ -137,7 +137,7 @@ grep -E "^# (nvml_device|cuda_device|device|gpu)" "$OUT/stdout.txt" || \
 echo
 echo "Per GPU during the run, from nvidia-smi:"
 awk -F', *' '{ n[$1]++; p[$1]+=$2; if($3>u[$1]) u[$1]=$3 }
-     END { for (i in n) printf "  GPU %s: mean %.1f W, peak utilisation %s%%, %d samples\n", i, p[i]/n[i], u[i], n[i] }' \
+     END { for (i in n) printf "  GPU %s: mean %.1f W, peak utilisation %d%%, %d samples\n", i, p[i]/n[i], u[i]+0, n[i] }' \
      "$OUT/run.log" | sort
 
 BUSY=$(awk -F', *' '{ if($3>u[$1]) u[$1]=$3 }
@@ -215,11 +215,13 @@ echo "  is honest and the kernel genuinely draws little; the paper should then"
 echo "  say the device is far from saturated and report idle draw beside it."
 echo
 echo "  If the busiest GPU drew much more than the program reported, the program"
-echo "  is reading a different card or a stale value. Check whether the busiest"
-echo "  index equals the --device index that was passed ($DEV). If it does not,"
-echo "  the CUDA and NVML orders disagree on this machine, and any energy"
-echo "  already collected here is void and has to be measured again; exporting"
-echo "  CUDA_DEVICE_ORDER=PCI_BUS_ID makes the two orders agree."
+echo "  is reading a different card or a stale value. Compare the busiest index"
+echo "  above against the --device index that was passed ($DEV), and compare the"
+echo "  bus id in the program's nvml_device line against the table in section 1."
+echo "  The usual reason they disagree is CUDA_VISIBLE_DEVICES, shown in section"
+echo "  1: it renumbers what CUDA sees while NVML goes on counting every card in"
+echo "  the machine, so CUDA_DEVICE_ORDER=PCI_BUS_ID does not help. Any energy"
+echo "  collected before the program resolved its handle by PCI bus id is void."
 echo
 echo "  If section 5 shows the value changing rarely or never, the driver is not"
 echo "  refreshing it at the rate the sampler assumes, and the poll interval"
