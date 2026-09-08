@@ -227,6 +227,17 @@ static bool power_window(double t0, double t1, double *energy_j,
     return true;
 }
 
+// Cumulative device energy since the driver was last loaded, in millijoules.
+// Volta and newer expose this counter; where it is missing the read fails and
+// the column is left empty rather than the run failing. It integrates inside
+// the device, so unlike the sampled figure it does not depend on how often the
+// driver refreshes its power reading: bracketing a window with two reads gives
+// that window's energy even when the window is shorter than one refresh.
+static bool energy_counter_mj(unsigned long long *mj)
+{
+    return nvmlDeviceGetTotalEnergyConsumption(g_nvml_device, mj) == NVML_SUCCESS;
+}
+
 static void power_dump_csv(const char *path)
 {
     FILE *f = fopen(path, "w");
@@ -1118,6 +1129,8 @@ int main(int argc, char **argv)
     double *energy_j   = (double *)calloc(trials, sizeof(double));
     double *power_w    = (double *)calloc(trials, sizeof(double));
     bool   *energy_ok  = (bool *)calloc(trials, sizeof(bool));
+    double *energy_ctr_j  = (double *)calloc(trials, sizeof(double));
+    bool   *energy_ctr_ok = (bool *)calloc(trials, sizeof(bool));
 
     cudaEvent_t ev_start, ev_stop;
     if (!run_cpu) {
@@ -1126,7 +1139,7 @@ int main(int argc, char **argv)
     }
 
     printf("trial,kernel_s,endtoend_s");
-    if (measure_energy) printf(",energy_j,mean_power_w,power_samples");
+    if (measure_energy) printf(",energy_j,mean_power_w,power_samples,energy_counter_j");
     if (verify) printf(",mismatches");
     printf("\n");
 
@@ -1141,6 +1154,8 @@ int main(int argc, char **argv)
 
         double t0 = 0.0, t1 = 0.0, kernel_seconds = 0.0;
         double trial_joules = 0.0;
+        unsigned long long ctr0 = 0, ctr1 = 0;
+        bool ctr_ok = false;
 
         if (run_cpu) {
             if (measure_energy) rapl_begin();
@@ -1150,6 +1165,7 @@ int main(int argc, char **argv)
             kernel_seconds = t1 - t0;
             if (measure_energy) trial_joules = rapl_end_joules();
         } else {
+            const bool ctr_started = measure_energy && energy_counter_mj(&ctr0);
             t0 = now_seconds();
             CUDA_CHECK(cudaMemcpy(dis_d, dis, bytes, cudaMemcpyHostToDevice));
 
@@ -1181,6 +1197,7 @@ int main(int argc, char **argv)
 
             CUDA_CHECK(cudaMemcpy(dis, dis_d, bytes, cudaMemcpyDeviceToHost));
             t1 = now_seconds();
+            if (ctr_started) ctr_ok = energy_counter_mj(&ctr1);
         }
 
         long long bad = 0;
@@ -1202,11 +1219,17 @@ int main(int argc, char **argv)
             power_w[t]   = trial_joules / (t1 - t0);
             energy_ok[t] = true;
         }
+        if (ctr_ok) {
+            energy_ctr_j[t]  = (double)(ctr1 - ctr0) / 1000.0;
+            energy_ctr_ok[t] = true;
+        }
 
         printf("%d,%.6f,%.6f", t + 1, kernel_s[t], endtoend_s[t]);
         if (measure_energy) {
             if (energy_ok[t]) printf(",%.3f,%.3f,%d", energy_j[t], power_w[t], nsamp);
             else              printf(",,,%d", nsamp);
+            if (energy_ctr_ok[t]) printf(",%.3f", energy_ctr_j[t]);
+            else                  printf(",");
         }
         if (verify) printf(",%lld", bad);
         printf("\n");
@@ -1222,7 +1245,8 @@ int main(int argc, char **argv)
                     fprintf(f, "nodes,topology,target,gpu,layout,dpx,store,sync,"
                                "block_threads,grid_blocks,trial,kernel_s,"
                                "endtoend_s,energy_j,"
-                               "mean_power_w,power_samples,mismatches\n");
+                               "mean_power_w,power_samples,energy_counter_j,"
+                               "mismatches\n");
                 fprintf(f, "%d,%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%.6f,%.6f,",
                         V, topology_name(topo), run_cpu ? "cpu" : "gpu",
                         run_cpu ? cpu_desc() : prop.name,
@@ -1237,6 +1261,8 @@ int main(int argc, char **argv)
                     fprintf(f, "%.3f,%.3f,%d,", energy_j[t], power_w[t], nsamp);
                 else
                     fprintf(f, ",,%d,", nsamp);
+                if (energy_ctr_ok[t]) fprintf(f, "%.3f,", energy_ctr_j[t]);
+                else                  fprintf(f, ",");
                 if (verify) fprintf(f, "%lld\n", bad); else fprintf(f, "\n");
                 fclose(f);
             }
@@ -1270,6 +1296,24 @@ int main(int argc, char **argv)
         } else {
             printf("# energy_j   not reported: fewer than two power samples per window\n");
         }
+
+        int cgood = 0;
+        double csum = 0.0;
+        for (int t = 0; t < trials; t++)
+            if (energy_ctr_ok[t]) { csum += energy_ctr_j[t]; cgood++; }
+        if (cgood >= 1) {
+            double cmean = csum / cgood;
+            double *tmp = (double *)calloc(cgood, sizeof(double));
+            int m = 0;
+            for (int t = 0; t < trials; t++)
+                if (energy_ctr_ok[t]) tmp[m++] = energy_ctr_j[t];
+            printf("# energy_ctr mean %.3f  std %.3f  over %d of %d trials\n",
+                   cmean, stddev_of(tmp, cgood, cmean), cgood, trials);
+            free(tmp);
+        } else if (!run_cpu) {
+            printf("# energy_ctr not available: this driver does not expose "
+                   "nvmlDeviceGetTotalEnergyConsumption\n");
+        }
     }
 
     if (!run_cpu) {
@@ -1286,6 +1330,8 @@ int main(int argc, char **argv)
     free(energy_j);
     free(power_w);
     free(energy_ok);
+    free(energy_ctr_j);
+    free(energy_ctr_ok);
     free(g_samples);
     return 0;
 }
