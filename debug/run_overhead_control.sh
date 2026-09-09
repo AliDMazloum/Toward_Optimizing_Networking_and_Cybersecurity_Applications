@@ -130,36 +130,89 @@ ${NVCC:-nvcc} -O3 -gencode arch=compute_$ARCHES,code=sm_$ARCHES \
     -DPIN_EXIT_FIRST=1 App2/smith_waterman_dpi.cu \
     ${NVML_LIBS:--lnvidia-ml -lpthread} -o "$PINNED" || exit 1
 
-echo "Built $NEW, $PINNED and $OLD"
+# The payload-only build. All four pins together fix a binary to one point of
+# the sweep, which would mean sixteen binaries per card. Only one of them is a
+# loop bound: the payload length is the outer loop's trip count, and the sweep
+# uses exactly two payload lengths. If this build matches the fully pinned one,
+# the whole cost is that single bound and two binaries per card cover
+# everything, which is the difference between a small change and a large one.
+PAYPIN=App2/smith_waterman_dpi-$TAG-paypin
+${NVCC:-nvcc} -O3 -gencode arch=compute_$ARCHES,code=sm_$ARCHES \
+    -DPIN_PAYLOAD=$PAY App2/smith_waterman_dpi.cu \
+    ${NVML_LIBS:--lnvidia-ml -lpthread} -o "$PAYPIN" || exit 1
+
+echo "Built $NEW, $PINNED, $PAYPIN and $OLD"
 echo
 
 # Registers and spills, from the compiler rather than from a run. A kernel that
-# spills to local memory is slower for a reason the timings alone cannot show,
-# and the two programs can differ there without differing anywhere else.
-echo "Register use for sm_$ARCHES, from ptxas:"
-for src in "$OLD_SRC" App2/smith_waterman_dpi.cu; do
-    echo "  $src"
+# spills to local memory is slower for a reason the timings alone cannot show.
+# The current program instantiates its kernel sixteen times, so the mangled
+# template arguments are translated: sw_scan<signature length, intrinsic on,
+# rows in registers, regex mode>. Only one of the sixteen is measured here, the
+# one this control's configuration selects.
+regs() {   # regs <source> [extra flags]
+    src=$1; shift
     ${NVCC:-nvcc} -O3 -gencode arch=compute_$ARCHES,code=sm_$ARCHES \
-        -Xptxas -v -c "$src" -o /dev/null 2>&1 \
-        | sed -n 's/^ptxas info *: *\(Used.*\)/      \1/p;s/^ptxas info *: *\(Function properties for .*\)/    \1/p' \
-        | head -20
-done
+        "$@" -Xptxas -v -c "$src" -o /dev/null 2>&1 \
+        | awk '
+            /Function properties for/ {
+                label = $0
+                sub(/.*Function properties for /, "", label)
+                # sw_scan<signature length, intrinsic, rows in registers, regex>
+                if (match(label, /_Z7sw_scanILi[0-9]+ELb[01]ELb[01]ELb[01]E/)) {
+                    a = substr(label, RSTART, RLENGTH)
+                    gsub(/[^0-9]/, " ", a)
+                    split(a, f, " ")
+                    label = sprintf("sw_scan<len %s, dpx %s, regrows %s, regex %s>",
+                                    f[2], f[3], f[4], f[5])
+                }
+                spill = ""
+                next
+            }
+            /spill stores/ {
+                if ($0 !~ /0 bytes spill stores/) spill = "  SPILLS"
+                next
+            }
+            /Used [0-9]+ registers/ {
+                for (i = 1; i <= NF; i++) if ($i == "Used") u = $(i + 1)
+                printf "    %-48s %3d registers%s\n", label, u, spill
+            }'
+}
+
+echo "Register use for sm_$ARCHES, from ptxas:"
+echo "  $OLD_SRC"
+regs "$OLD_SRC"
+echo "  App2/smith_waterman_dpi.cu, unpinned"
+regs App2/smith_waterman_dpi.cu
+echo "  App2/smith_waterman_dpi.cu, payload pinned to $PAY"
+regs App2/smith_waterman_dpi.cu -DPIN_PAYLOAD=$PAY
 echo
 
 # ---------------------------------------------------------------------------
-# mean_of <file>   reads one number per line, drops the first, prints the mean,
-#                  the smallest, the largest and the spread as a percentage.
+# mean_of <file>   reads one number per line, drops the first, prints the
+#                  median, the mean, the smallest, the largest, the spread as a
+#                  percentage, and the count.
+#
+# The median leads because this card's readings are not unimodal: a cold clock
+# boosts for whole trials and then settles, so a run of five holds a cluster of
+# repeated sustained values and one or two fast excursions. The mean of that is
+# neither. The sustained figure is what gets reported, by the same rule the
+# routing measurements follow, and with five readings the median is the closest
+# robust estimate of it. Where the two agree the distribution is unimodal and
+# the distinction does not arise.
 mean_of() {
     awk 'NR > 1 { v[++n] = $1; s += $1 }
          END {
              if (n == 0) { print "no runs"; exit }
              m = s / n
-             lo = hi = v[1]
-             for (i = 1; i <= n; i++) {
-                 if (v[i] < lo) lo = v[i]
-                 if (v[i] > hi) hi = v[i]
+             for (i = 2; i <= n; i++) {       # insertion sort, n is 5
+                 x = v[i]
+                 for (j = i - 1; j >= 1 && v[j] > x; j--) v[j + 1] = v[j]
+                 v[j + 1] = x
              }
-             printf "%.6f %.6f %.6f %.2f %d", m, lo, hi, (hi - lo) / m * 100, n
+             med = (n % 2) ? v[(n + 1) / 2] : (v[n / 2] + v[n / 2 + 1]) / 2
+             printf "%.6f %.6f %.6f %.6f %.2f %d",
+                    med, m, v[1], v[n], (v[n] - v[1]) / m * 100, n
          }' "$1"
 }
 
@@ -169,8 +222,8 @@ report() {   # report <label> <file>
         printf "  %-38s did not run\n" "$1"
         return
     fi
-    printf "  %-38s mean %s s   range %s to %s   spread %s %%   n=%s\n" \
-           "$1" "$2" "$3" "$4" "$5" "$6"
+    printf "  %-34s median %s  mean %s  range %s to %s  spread %s %%  n=%s\n" \
+           "$1" "$2" "$3" "$4" "$5" "$6" "$7"
 }
 
 # ---------------------------------------------------------------------------
@@ -237,15 +290,25 @@ echo "=============================================================="
 new_arm E "$SCRATCH/E.times" 64 1 0 "$PINNED"
 echo
 
+echo "=============================================================="
+echo "Arm F: the current program with only the payload pinned, block 64"
+echo "=============================================================="
+new_arm F "$SCRATCH/F.times" 64 1 0 "$PAYPIN"
+echo
+
 # ---------------------------------------------------------------------------
 echo "=============================================================="
 echo "What happened"
 echo "=============================================================="
+echo "  Every ratio below is taken on the medians, for the reason given above"
+echo "  the statistic."
+echo
 report "A original, cold, block 64" "$SCRATCH/A.times"
 report "B current, cold, block 64" "$SCRATCH/B.times"
 report "C current, cold, block 32" "$SCRATCH/C.times"
 report "D current, swept protocol" "$SCRATCH/D.times"
-report "E current pinned, cold, block 64" "$SCRATCH/E.times"
+report "E current all pins, cold, block 64" "$SCRATCH/E.times"
+report "F current payload pin, cold, block 64" "$SCRATCH/F.times"
 echo
 
 ratio() {   # ratio <label> <numerator file> <denominator file>
@@ -261,8 +324,9 @@ ratio() {   # ratio <label> <numerator file> <denominator file>
 ratio "B over A, what the current program costs" "$SCRATCH/B.times" "$SCRATCH/A.times"
 ratio "C over B, what 32 threads per block costs" "$SCRATCH/C.times" "$SCRATCH/B.times"
 ratio "D over C, what a warm clock is worth" "$SCRATCH/D.times" "$SCRATCH/C.times"
-ratio "E over A, the pinned build against the original" "$SCRATCH/E.times" "$SCRATCH/A.times"
+ratio "E over A, all pins against the original" "$SCRATCH/E.times" "$SCRATCH/A.times"
 ratio "B over E, what the run-time parameters cost" "$SCRATCH/B.times" "$SCRATCH/E.times"
+ratio "F over E, what the other three pins add" "$SCRATCH/F.times" "$SCRATCH/E.times"
 ratio "D over A, the swept number against the original" "$SCRATCH/D.times" "$SCRATCH/A.times"
 echo
 echo "  B over A is the figure the comparison rests on. On the H200 it measured"
@@ -270,12 +334,16 @@ echo "  3.1 percent, on the A100 73.3 percent, both on 2026-09-09, so the two"
 echo "  cards do not carry the same program cost and every cross-chip ratio is"
 echo "  inflated by the difference between them."
 echo
-echo "  E and the two ratios around it say whether that difference is the"
-echo "  run-time parameters. The original's problem size is known to its"
-echo "  compiler and the current program's is not, so the payload loop's trip"
-echo "  count and the threshold are constants in one and registers in the"
-echo "  other. If E lands near A, that is the whole story and pinning the"
-echo "  reported build fixes it. If E stays near B, the cost is somewhere else"
-echo "  and the register report above is the next place to look."
+echo "  E says whether that difference is the run-time parameters: the"
+echo "  original's problem size is known to its compiler and the current"
+echo "  program's is not, so the payload loop's trip count and the detection"
+echo "  threshold are constants in one and registers in the other. E landing"
+echo "  near A means that is the whole story."
+echo
+echo "  F then says how much of the fix is needed. All four pins together fix a"
+echo "  binary to one point of the sweep, which is sixteen binaries per card."
+echo "  The payload length alone is two, because it is the only pin that is a"
+echo "  loop bound and the sweep uses two payload lengths. F near E means the"
+echo "  cheap fix is the whole fix."
 echo
 echo "  Nothing here is appended to any csv. Copy this output into the notes."
