@@ -10,12 +10,12 @@
 #define HELPERS_H
 
 #define PayloadSize 512
-#define NumberOfSignatures 1000000
+#define NumberOfSignatures 10000000
 #define MaxSignatureLength 16
-#define MatchingIndex 9915
+#define MatchingIndex 99152
 #define CopyLen 14
 
-#define midPoint 500000
+#define midPoint 5000000
 
 const int blockSize = 64; 
 const int gridSize = (midPoint + blockSize - 1) / blockSize;
