@@ -162,21 +162,32 @@ echo
 # Registers and spills, read out of the builds themselves rather than from a
 # second round of compiles. A kernel that spills to local memory is slower for
 # a reason no timing can show. The current program instantiates its kernel
-# sixteen times, so the mangled template arguments are translated and only the
-# instantiation this control selects is printed.
-WANT="sw_scan<len $LEN, dpx 1, regrows 1, regex 0>"
+# thirty-two times, so the mangled template arguments are translated and only
+# the instantiations worth looking at are printed.
+#
+# Both signature lengths are printed, not only the one this control times. The
+# sweep runs (512, 16) and (1024, 32), and the longer signature is much the
+# heavier kernel: on the A100 it compiled to 237 registers against 126, which
+# is about 13 percent occupancy, so it stands to gain more from anything that
+# frees registers, and no arm here times it. Printing both means a rebuild
+# shows whether it gained.
+WANT="dpx 1, regrows 1, regex 0,"
 
 regs_from() {   # regs_from <build log> <label>
     awk -v want="$WANT" -v tag="$2" '
         /Function properties for/ {
             label = $0
             sub(/.*Function properties for /, "", label)
-            if (match(label, /_Z7sw_scanILi[0-9]+ELb[01]ELb[01]ELb[01]E/)) {
+            # Five template parameters since the early-exit flag joined them:
+            # sw_scan<signature length, intrinsic, rows in registers, regex,
+            # exit at first report>. The last one must appear in the label or
+            # its two instantiations print as indistinguishable duplicates.
+            if (match(label, /_Z7sw_scanILi[0-9]+ELb[01]ELb[01]ELb[01]ELb[01]E/)) {
                 a = substr(label, RSTART, RLENGTH)
                 gsub(/[^0-9]/, " ", a)
                 split(a, f, " ")
-                label = sprintf("sw_scan<len %s, dpx %s, regrows %s, regex %s>",
-                                f[2], f[3], f[4], f[5])
+                label = sprintf("sw_scan<len %s, dpx %s, regrows %s, regex %s, exit %s>",
+                                f[2], f[3], f[4], f[5], f[6])
             }
             spill = ""
             next
@@ -186,9 +197,13 @@ regs_from() {   # regs_from <build log> <label>
             next
         }
         /Used [0-9]+ registers/ {
-            if (want != "" && label != want) next
+            if (want != "" && index(label, want) == 0) next
             for (i = 1; i <= NF; i++) if ($i == "Used") u = $(i + 1)
-            printf "    %-22s %3d registers%s\n", tag, u, spill
+            what = label
+            sub(/^sw_scan<len /, "", what)
+            sub(/, dpx [01], regrows [01], regex [01], exit /, " exit ", what)
+            sub(/>$/, "", what)
+            printf "    %-22s len %-10s %3d registers%s\n", tag, what, u, spill
         }' "$1"
 }
 
