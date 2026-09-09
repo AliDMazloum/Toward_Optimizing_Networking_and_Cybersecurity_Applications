@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Measure what the current App2 program costs against the original one, on this
-# machine, at one configuration.
+# machine, and find which run-time parameter accounts for the difference.
 #
 # The original program is Old_files/App2/DPI_v7.2.cu. Its problem size is fixed
 # at compile time, it uses the halfword intrinsic unconditionally, and it
@@ -12,33 +12,35 @@
 # That size is therefore read out of the original source rather than written
 # here. Setting it in two places would let the two drift apart, and a control
 # that compares one size against another reports a ratio that is mostly the
-# size difference. Whatever the constants say is what both arms run.
+# size difference. Whatever the constants say is what every arm runs.
 #
 # Both programs are run as separate processes, one timed launch each, because
 # the original has no trial loop and its warm-up is commented out: it measures
 # a cold launch. Comparing that against a warm mean would charge the difference
 # to the program instead of to the clock state. The first run of each arm is
-# discarded, the rest are averaged.
+# discarded, the rest are summarised.
 #
-# Four arms, so that three separate effects can be told apart:
+# The arms:
 #
-#   A  original, cold single launch
-#   B  current, cold single launch, 64 threads per block, the same geometry
-#   C  current, cold single launch, 32 threads per block, the swept geometry
-#   D  current, the swept protocol, five trials after one warm-up
+#   A          original, cold single launch
+#   B          current, cold single launch, 64 threads per block, same geometry
+#   C          current, cold single launch, 32 threads per block, swept geometry
+#   D          current, the swept protocol, five trials after one warm-up
+#   one per    current, built with a PIN_ macro that turns a run-time parameter
+#   pin set    into a compile-time constant, cold, 64 threads per block
 #
 # B over A is what the current program costs at matched geometry. C over B is
-# what the block size costs. D against C is what a warm clock is worth. The
-# swept number is D.
+# what the block size costs. D against C is what a warm clock is worth. Each
+# pin arm against A says whether that parameter is the cause.
 #
 # Usage, from the root of the clone:
 #
 #   ./debug/run_overhead_control.sh a100
 #   ./debug/run_overhead_control.sh h200
 #
-# The original program writes a signatures.txt of about 160 MB into the working
-# directory on every run and does not remove it. This script runs each arm in
-# its own scratch directory and deletes it at the end.
+# The original writes a signatures file of about 160 MB into its working
+# directory on every run and does not remove it. Each arm runs in a scratch
+# directory that is deleted at the end.
 
 set -u
 
@@ -57,11 +59,14 @@ esac
 NEW=App2/smith_waterman_dpi-$TAG
 OLD_SRC=Old_files/App2/DPI_v7.2.cu
 OLD=Old_files/App2/DPI_v7.2-$TAG
+SRC=App2/smith_waterman_dpi.cu
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/overhead.XXXXXX")
 ROOT=$(pwd)
 
-# The configuration, read from the original source so that the two arms cannot
-# run different sizes.
+cleanup() { rm -rf "$SCRATCH"; }
+trap cleanup EXIT
+
+# The configuration, read from the original source so the arms cannot diverge.
 constant() {   # constant <name>
     sed -n "s/^#define $1  *\([0-9][0-9]*\).*/\1/p" "$OLD_SRC" | head -1
 }
@@ -75,8 +80,19 @@ if [ -z "$SIGS" ] || [ -z "$PAY" ] || [ -z "$LEN" ]; then
     exit 1
 fi
 
-cleanup() { rm -rf "$SCRATCH"; }
-trap cleanup EXIT
+# The detection threshold is floor(alpha * signature length) with the swept
+# alpha of 0.8, so it is derived from a measured input rather than typed.
+THRESHOLD=$(awk -v l="$LEN" 'BEGIN { printf "%d", int(0.8 * l) }')
+
+# One entry per build: a label, a semicolon, the flags. "all" comes first so a
+# session cut short still has the figure that matters most. The payload pin is
+# not scanned by default: it was measured on the A100 on 2026-09-09 and changed
+# neither the timing nor a single register count, so it is settled. Put it back
+# by overriding PIN_SETS if that ever needs rechecking.
+PIN_SETS=${PIN_SETS:-"all;-DPIN_SIGNATURES=$SIGS -DPIN_PAYLOAD=$PAY -DPIN_THRESHOLD=$THRESHOLD -DPIN_EXIT_FIRST=1
+signatures;-DPIN_SIGNATURES=$SIGS
+threshold;-DPIN_THRESHOLD=$THRESHOLD
+exit-first;-DPIN_EXIT_FIRST=1"}
 
 name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
 case "$name" in
@@ -91,12 +107,12 @@ echo "Configuration, read from $OLD_SRC:"
 echo "  $SIGS signatures, $PAY byte payload, $LEN byte signatures"
 if [ "$SIGS" -lt 5000000 ]; then
     echo
-    echo "  NOTE this is a short run. The H200 figure this control is compared"
-    echo "       against was taken at 10,000,000 signatures, where the kernel"
+    echo "  NOTE this is a short run. The figures this control is compared"
+    echo "       against were taken at 10,000,000 signatures, where the kernel"
     echo "       runs about a second on the A100 and cold-launch noise is a"
-    echo "       small fraction of it. Below that the noise grows and the two"
-    echo "       numbers are not comparable with the earlier one. Restore the"
-    echo "       constants in the original source to compare against it."
+    echo "       small fraction of it. Below that the noise grows and the"
+    echo "       numbers are not comparable with the earlier ones. Restore the"
+    echo "       constants in the original source to compare against them."
 fi
 echo
 
@@ -110,82 +126,83 @@ if [ ! -x "$NEW" ]; then
     exit 1
 fi
 
-# The original is built here rather than through the Makefile, because it is
-# not one of the programs the Makefile maintains. Same optimisation level and
-# same architecture as the current program; it needs neither NVML nor OpenMP.
-${NVCC:-nvcc} -O3 -gencode arch=compute_$ARCHES,code=sm_$ARCHES \
-    "$OLD_SRC" -o "$OLD" || exit 1
+# The original, built here rather than through the Makefile because it is not
+# one of the programs the Makefile maintains. Same optimisation level and
+# architecture as the current program; it needs neither NVML nor OpenMP.
+${NVCC:-nvcc} -O3 -gencode arch=compute_$ARCHES,code=sm_$ARCHES -Xptxas -v \
+    "$OLD_SRC" -o "$OLD" > "$SCRATCH/build.old" 2>&1
+if [ ! -x "$OLD" ]; then
+    echo "The original did not build:" >&2
+    cat "$SCRATCH/build.old" >&2
+    exit 1
+fi
 
-# The pinned build. The original's problem size is a compile-time constant, so
-# its compiler knows the payload loop's trip count and the threshold; the
-# current program takes both at run time and its compiler does not. The kernel
-# carries PIN_ macros that put those back, and this build turns them on, so the
-# difference between arm B and arm E is what the run-time parameters cost. The
-# threshold is floor(alpha * signature length) with the swept alpha of 0.8, so
-# it is derived here rather than typed.
-THRESHOLD=$(awk -v l="$LEN" 'BEGIN { printf "%d", int(0.8 * l) }')
-PINNED=App2/smith_waterman_dpi-$TAG-pinned
-${NVCC:-nvcc} -O3 -gencode arch=compute_$ARCHES,code=sm_$ARCHES \
-    -DPIN_SIGNATURES=$SIGS -DPIN_PAYLOAD=$PAY -DPIN_THRESHOLD=$THRESHOLD \
-    -DPIN_EXIT_FIRST=1 App2/smith_waterman_dpi.cu \
-    ${NVML_LIBS:--lnvidia-ml -lpthread} -o "$PINNED" || exit 1
+# The unpinned current program, compiled again only to capture its register
+# report; the binary the Makefile already produced is the one that runs.
+${NVCC:-nvcc} -O3 -gencode arch=compute_$ARCHES,code=sm_$ARCHES -Xptxas -v \
+    "$SRC" ${NVML_LIBS:--lnvidia-ml -lpthread} -o /dev/null \
+    > "$SCRATCH/build.none" 2>&1
 
-# The payload-only build. All four pins together fix a binary to one point of
-# the sweep, which would mean sixteen binaries per card. Only one of them is a
-# loop bound: the payload length is the outer loop's trip count, and the sweep
-# uses exactly two payload lengths. If this build matches the fully pinned one,
-# the whole cost is that single bound and two binaries per card cover
-# everything, which is the difference between a small change and a large one.
-PAYPIN=App2/smith_waterman_dpi-$TAG-paypin
-${NVCC:-nvcc} -O3 -gencode arch=compute_$ARCHES,code=sm_$ARCHES \
-    -DPIN_PAYLOAD=$PAY App2/smith_waterman_dpi.cu \
-    ${NVML_LIBS:--lnvidia-ml -lpthread} -o "$PAYPIN" || exit 1
+printf '%s\n' "$PIN_SETS" | while IFS=';' read -r pinlabel pinflags; do
+    [ -z "$pinlabel" ] && continue
+    ${NVCC:-nvcc} -O3 -gencode arch=compute_$ARCHES,code=sm_$ARCHES -Xptxas -v \
+        $pinflags "$SRC" ${NVML_LIBS:--lnvidia-ml -lpthread} \
+        -o "App2/smith_waterman_dpi-$TAG-pin-$pinlabel" \
+        > "$SCRATCH/build.$pinlabel" 2>&1
+    if [ ! -x "App2/smith_waterman_dpi-$TAG-pin-$pinlabel" ]; then
+        echo "Build failed for pin set $pinlabel:" >&2
+        tail -20 "$SCRATCH/build.$pinlabel" >&2
+    fi
+done
 
-echo "Built $NEW, $PINNED, $PAYPIN and $OLD"
+echo "Built the original, the current program, and one binary per pin set."
 echo
 
-# Registers and spills, from the compiler rather than from a run. A kernel that
-# spills to local memory is slower for a reason the timings alone cannot show.
-# The current program instantiates its kernel sixteen times, so the mangled
-# template arguments are translated: sw_scan<signature length, intrinsic on,
-# rows in registers, regex mode>. Only one of the sixteen is measured here, the
-# one this control's configuration selects.
-regs() {   # regs <source> [extra flags]
-    src=$1; shift
-    ${NVCC:-nvcc} -O3 -gencode arch=compute_$ARCHES,code=sm_$ARCHES \
-        "$@" -Xptxas -v -c "$src" -o /dev/null 2>&1 \
-        | awk '
-            /Function properties for/ {
-                label = $0
-                sub(/.*Function properties for /, "", label)
-                # sw_scan<signature length, intrinsic, rows in registers, regex>
-                if (match(label, /_Z7sw_scanILi[0-9]+ELb[01]ELb[01]ELb[01]E/)) {
-                    a = substr(label, RSTART, RLENGTH)
-                    gsub(/[^0-9]/, " ", a)
-                    split(a, f, " ")
-                    label = sprintf("sw_scan<len %s, dpx %s, regrows %s, regex %s>",
-                                    f[2], f[3], f[4], f[5])
-                }
-                spill = ""
-                next
+# ---------------------------------------------------------------------------
+# Registers and spills, read out of the builds themselves rather than from a
+# second round of compiles. A kernel that spills to local memory is slower for
+# a reason no timing can show. The current program instantiates its kernel
+# sixteen times, so the mangled template arguments are translated and only the
+# instantiation this control selects is printed.
+WANT="sw_scan<len $LEN, dpx 1, regrows 1, regex 0>"
+
+regs_from() {   # regs_from <build log> <label>
+    awk -v want="$WANT" -v tag="$2" '
+        /Function properties for/ {
+            label = $0
+            sub(/.*Function properties for /, "", label)
+            if (match(label, /_Z7sw_scanILi[0-9]+ELb[01]ELb[01]ELb[01]E/)) {
+                a = substr(label, RSTART, RLENGTH)
+                gsub(/[^0-9]/, " ", a)
+                split(a, f, " ")
+                label = sprintf("sw_scan<len %s, dpx %s, regrows %s, regex %s>",
+                                f[2], f[3], f[4], f[5])
             }
-            /spill stores/ {
-                if ($0 !~ /0 bytes spill stores/) spill = "  SPILLS"
-                next
-            }
-            /Used [0-9]+ registers/ {
-                for (i = 1; i <= NF; i++) if ($i == "Used") u = $(i + 1)
-                printf "    %-48s %3d registers%s\n", label, u, spill
-            }'
+            spill = ""
+            next
+        }
+        /spill stores/ {
+            if ($0 !~ /0 bytes spill stores/) spill = "  SPILLS"
+            next
+        }
+        /Used [0-9]+ registers/ {
+            if (want != "" && label != want) next
+            for (i = 1; i <= NF; i++) if ($i == "Used") u = $(i + 1)
+            printf "    %-22s %3d registers%s\n", tag, u, spill
+        }' "$1"
 }
 
-echo "Register use for sm_$ARCHES, from ptxas:"
-echo "  $OLD_SRC"
-regs "$OLD_SRC"
-echo "  App2/smith_waterman_dpi.cu, unpinned"
-regs App2/smith_waterman_dpi.cu
-echo "  App2/smith_waterman_dpi.cu, payload pinned to $PAY"
-regs App2/smith_waterman_dpi.cu -DPIN_PAYLOAD=$PAY
+echo "Registers for sm_$ARCHES, for the one kernel this control runs:"
+echo "  $WANT"
+awk '/Used [0-9]+ registers/ {
+         for (i = 1; i <= NF; i++) if ($i == "Used") u = $(i + 1)
+         printf "    %-22s %3d registers  (its only kernel)\n", "original", u
+     }' "$SCRATCH/build.old"
+regs_from "$SCRATCH/build.none" "no pins"
+printf '%s\n' "$PIN_SETS" | while IFS=';' read -r pinlabel pinflags; do
+    [ -z "$pinlabel" ] && continue
+    [ -f "$SCRATCH/build.$pinlabel" ] && regs_from "$SCRATCH/build.$pinlabel" "pin $pinlabel"
+done
 echo
 
 # ---------------------------------------------------------------------------
@@ -205,7 +222,7 @@ mean_of() {
          END {
              if (n == 0) { print "no runs"; exit }
              m = s / n
-             for (i = 2; i <= n; i++) {       # insertion sort, n is 5
+             for (i = 2; i <= n; i++) {       # insertion sort, n is small
                  x = v[i]
                  for (j = i - 1; j >= 1 && v[j] > x; j--) v[j + 1] = v[j]
                  v[j + 1] = x
@@ -219,11 +236,21 @@ mean_of() {
 report() {   # report <label> <file>
     set -- "$1" $(mean_of "$2")
     if [ "$2" = "no" ]; then
-        printf "  %-38s did not run\n" "$1"
+        printf "  %-34s did not run\n" "$1"
         return
     fi
     printf "  %-34s median %s  mean %s  range %s to %s  spread %s %%  n=%s\n" \
            "$1" "$2" "$3" "$4" "$5" "$6" "$7"
+}
+
+ratio() {   # ratio <label> <numerator file> <denominator file>
+    n=$(mean_of "$2" | awk '{print $1}')
+    d=$(mean_of "$3" | awk '{print $1}')
+    case "$n$d" in
+        *no*) printf "  %-46s an arm is missing\n" "$1"; return ;;
+    esac
+    awk -v n="$n" -v d="$d" -v l="$1" \
+        'BEGIN { printf "  %-46s %6.3f  (%+.1f %%)\n", l, n/d, (n/d - 1) * 100 }'
 }
 
 # ---------------------------------------------------------------------------
@@ -244,16 +271,19 @@ for i in $(seq 1 $REPS); do
 done
 echo
 
-# ---------------------------------------------------------------------------
-# new_arm <label> <outfile> <block> <trials> <warmup> <binary>
+# new_arm <outfile> <block> <trials> <warmup> [binary]
 new_arm() {
-    label=$1; out=$2; block=$3; trials=$4; warmup=$5; bin=${6:-$NEW}
+    out=$1; block=$2; trials=$3; warmup=$4; bin=${5:-$NEW}
     : > "$out"
+    if [ ! -x "$bin" ]; then
+        echo "  $bin was not built; the arm is skipped." >&2
+        return
+    fi
     for i in $(seq 1 $REPS); do
         # No --verify here, so every arm runs with the same default the sweep
         # ran with. Verification happens on the host after the kernel and is
         # outside the timed window in any case.
-        t=$(./$bin --signatures $SIGS --payload $PAY --sig-len $LEN \
+        t=$(./"$bin" --signatures $SIGS --payload $PAY --sig-len $LEN \
                 --mode literal --rows registers --dpx on --block $block \
                 --trials $trials --warmup $warmup 2>&1 \
             | sed -n 's/^# kernel_s  *mean \([0-9.]*\) .*/\1/p')
@@ -269,81 +299,70 @@ new_arm() {
 echo "=============================================================="
 echo "Arm B: the current program, cold single launch, 64 threads per block"
 echo "=============================================================="
-new_arm B "$SCRATCH/B.times" 64 1 0
+new_arm "$SCRATCH/B.times" 64 1 0
 echo
 
 echo "=============================================================="
 echo "Arm C: the current program, cold single launch, 32 threads per block"
 echo "=============================================================="
-new_arm C "$SCRATCH/C.times" 32 1 0
+new_arm "$SCRATCH/C.times" 32 1 0
 echo
 
 echo "=============================================================="
 echo "Arm D: the current program, the swept protocol"
 echo "=============================================================="
-new_arm D "$SCRATCH/D.times" 32 5 1
+new_arm "$SCRATCH/D.times" 32 5 1
 echo
 
-echo "=============================================================="
-echo "Arm E: the current program pinned, cold single launch, block 64"
-echo "=============================================================="
-new_arm E "$SCRATCH/E.times" 64 1 0 "$PINNED"
-echo
-
-echo "=============================================================="
-echo "Arm F: the current program with only the payload pinned, block 64"
-echo "=============================================================="
-new_arm F "$SCRATCH/F.times" 64 1 0 "$PAYPIN"
-echo
+printf '%s\n' "$PIN_SETS" | while IFS=';' read -r pinlabel pinflags; do
+    [ -z "$pinlabel" ] && continue
+    echo "=============================================================="
+    echo "Pin arm '$pinlabel': cold single launch, 64 threads per block"
+    echo "  built with $pinflags"
+    echo "=============================================================="
+    new_arm "$SCRATCH/pin.$pinlabel.times" 64 1 0 \
+        "App2/smith_waterman_dpi-$TAG-pin-$pinlabel"
+    echo
+done
 
 # ---------------------------------------------------------------------------
 echo "=============================================================="
 echo "What happened"
 echo "=============================================================="
-echo "  Every ratio below is taken on the medians, for the reason given above"
-echo "  the statistic."
+echo "  Every ratio below is taken on the medians, for the reason recorded"
+echo "  above the statistic."
 echo
 report "A original, cold, block 64" "$SCRATCH/A.times"
 report "B current, cold, block 64" "$SCRATCH/B.times"
 report "C current, cold, block 32" "$SCRATCH/C.times"
 report "D current, swept protocol" "$SCRATCH/D.times"
-report "E current all pins, cold, block 64" "$SCRATCH/E.times"
-report "F current payload pin, cold, block 64" "$SCRATCH/F.times"
+printf '%s\n' "$PIN_SETS" | while IFS=';' read -r pinlabel pinflags; do
+    [ -z "$pinlabel" ] && continue
+    report "pin $pinlabel, cold, block 64" "$SCRATCH/pin.$pinlabel.times"
+done
 echo
-
-ratio() {   # ratio <label> <numerator file> <denominator file>
-    n=$(mean_of "$2" | awk '{print $1}')
-    d=$(mean_of "$3" | awk '{print $1}')
-    case "$n$d" in
-        *no*) echo "  $1: an arm is missing" ; return ;;
-    esac
-    awk -v n="$n" -v d="$d" -v l="$1" \
-        'BEGIN { printf "  %-46s %6.3f  (%+.1f %%)\n", l, n/d, (n/d - 1) * 100 }'
-}
 
 ratio "B over A, what the current program costs" "$SCRATCH/B.times" "$SCRATCH/A.times"
 ratio "C over B, what 32 threads per block costs" "$SCRATCH/C.times" "$SCRATCH/B.times"
 ratio "D over C, what a warm clock is worth" "$SCRATCH/D.times" "$SCRATCH/C.times"
-ratio "E over A, all pins against the original" "$SCRATCH/E.times" "$SCRATCH/A.times"
-ratio "B over E, what the run-time parameters cost" "$SCRATCH/B.times" "$SCRATCH/E.times"
-ratio "F over E, what the other three pins add" "$SCRATCH/F.times" "$SCRATCH/E.times"
-ratio "D over A, the swept number against the original" "$SCRATCH/D.times" "$SCRATCH/A.times"
+printf '%s\n' "$PIN_SETS" | while IFS=';' read -r pinlabel pinflags; do
+    [ -z "$pinlabel" ] && continue
+    ratio "pin $pinlabel over A, against the original" \
+          "$SCRATCH/pin.$pinlabel.times" "$SCRATCH/A.times"
+done
 echo
-echo "  B over A is the figure the comparison rests on. On the H200 it measured"
-echo "  3.1 percent, on the A100 73.3 percent, both on 2026-09-09, so the two"
-echo "  cards do not carry the same program cost and every cross-chip ratio is"
+
+echo "  B over A is the figure the comparison rests on. Measured 2026-09-09:"
+echo "  3.1 percent on the H200 and 78 percent on the A100, so the two cards"
+echo "  do not carry the same program cost and every cross-chip ratio is"
 echo "  inflated by the difference between them."
 echo
-echo "  E says whether that difference is the run-time parameters: the"
-echo "  original's problem size is known to its compiler and the current"
-echo "  program's is not, so the payload loop's trip count and the detection"
-echo "  threshold are constants in one and registers in the other. E landing"
-echo "  near A means that is the whole story."
-echo
-echo "  F then says how much of the fix is needed. All four pins together fix a"
-echo "  binary to one point of the sweep, which is sixteen binaries per card."
-echo "  The payload length alone is two, because it is the only pin that is a"
-echo "  loop bound and the sweep uses two payload lengths. F near E means the"
-echo "  cheap fix is the whole fix."
+echo "  The pin arms say where that cost lives. Pinning all four parameters"
+echo "  brings the A100 to within 1.4 percent of the original, so it is the"
+echo "  run-time parameters and nothing else; pinning the payload length alone"
+echo "  changed neither the timing nor a single register count. One of the"
+echo "  remaining three is therefore the whole cost, and the arm that lands"
+echo "  near A names it. The register lines above say whether it works by"
+echo "  freeing registers or by some other route."
 echo
 echo "  Nothing here is appended to any csv. Copy this output into the notes."
