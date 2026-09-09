@@ -108,9 +108,12 @@ application comes from, and it costs about 100 s per invocation at 24,000 nodes.
 ## run_overhead_control.sh
 
 Measures what the current App2 program costs against the original one, at the
-single configuration where the two can be compared: the original's problem size
-is fixed at compile time to 10,000,000 signatures, a 512 byte payload and 16
-byte signatures, which is one point of the current program's sweep.
+single configuration where the two can be compared. The original's problem size
+is fixed at compile time; the current program takes its size at run time, so the
+script reads the original's constants out of its source and runs both arms at
+those values. Setting the size in two places would let them drift apart, and a
+control that compares one size against another reports a ratio that is mostly
+the size difference.
 
     ./debug/run_overhead_control.sh a100
     ./debug/run_overhead_control.sh h200

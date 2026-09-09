@@ -4,11 +4,15 @@
 # machine, at one configuration.
 #
 # The original program is Old_files/App2/DPI_v7.2.cu. Its problem size is fixed
-# at compile time to 10,000,000 signatures, a 512 byte payload and 16 byte
-# signatures, it uses the halfword intrinsic unconditionally, and it launches
-# 64 threads per block over 5,000,000 threads. That is exactly one point of the
-# current program's sweep, so the two can be compared directly there and only
-# there.
+# at compile time, it uses the halfword intrinsic unconditionally, and it
+# launches 64 threads per block over half its signature count. The current
+# program takes its size at run time, so the comparison is only meaningful at
+# the size the original was compiled for.
+#
+# That size is therefore read out of the original source rather than written
+# here. Setting it in two places would let the two drift apart, and a control
+# that compares one size against another reports a ratio that is mostly the
+# size difference. Whatever the constants say is what both arms run.
 #
 # Both programs are run as separate processes, one timed launch each, because
 # the original has no trial loop and its warm-up is commented out: it measures
@@ -51,12 +55,25 @@ case "$MACHINE" in
 esac
 
 NEW=App2/smith_waterman_dpi-$TAG
+OLD_SRC=Old_files/App2/DPI_v7.2.cu
 OLD=Old_files/App2/DPI_v7.2-$TAG
-SIGS=10000000
-PAY=512
-LEN=16
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/overhead.XXXXXX")
 ROOT=$(pwd)
+
+# The configuration, read from the original source so that the two arms cannot
+# run different sizes.
+constant() {   # constant <name>
+    sed -n "s/^#define $1  *\([0-9][0-9]*\).*/\1/p" "$OLD_SRC" | head -1
+}
+SIGS=$(constant NumberOfSignatures)
+PAY=$(constant PayloadSize)
+LEN=$(constant MaxSignatureLength)
+if [ -z "$SIGS" ] || [ -z "$PAY" ] || [ -z "$LEN" ]; then
+    echo "Could not read the size constants out of $OLD_SRC. It defines" >&2
+    echo "NumberOfSignatures, PayloadSize and MaxSignatureLength; one of them" >&2
+    echo "is missing or is no longer a plain integer." >&2
+    exit 1
+fi
 
 cleanup() { rm -rf "$SCRATCH"; }
 trap cleanup EXIT
@@ -70,6 +87,17 @@ case "$name" in
         ;;
 esac
 echo "Scratch: $SCRATCH, $REPS runs per arm, first of each discarded."
+echo "Configuration, read from $OLD_SRC:"
+echo "  $SIGS signatures, $PAY byte payload, $LEN byte signatures"
+if [ "$SIGS" -lt 5000000 ]; then
+    echo
+    echo "  NOTE this is a short run. The H200 figure this control is compared"
+    echo "       against was taken at 10,000,000 signatures, where the kernel"
+    echo "       runs about a second on the A100 and cold-launch noise is a"
+    echo "       small fraction of it. Below that the noise grows and the two"
+    echo "       numbers are not comparable with the earlier one. Restore the"
+    echo "       constants in the original source to compare against it."
+fi
 echo
 
 # ---------------------------------------------------------------------------
@@ -86,7 +114,7 @@ fi
 # not one of the programs the Makefile maintains. Same optimisation level and
 # same architecture as the current program; it needs neither NVML nor OpenMP.
 ${NVCC:-nvcc} -O3 -gencode arch=compute_$ARCHES,code=sm_$ARCHES \
-    Old_files/App2/DPI_v7.2.cu -o "$OLD" || exit 1
+    "$OLD_SRC" -o "$OLD" || exit 1
 echo "Built $NEW and $OLD"
 echo
 
