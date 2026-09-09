@@ -115,7 +115,35 @@ fi
 # same architecture as the current program; it needs neither NVML nor OpenMP.
 ${NVCC:-nvcc} -O3 -gencode arch=compute_$ARCHES,code=sm_$ARCHES \
     "$OLD_SRC" -o "$OLD" || exit 1
-echo "Built $NEW and $OLD"
+
+# The pinned build. The original's problem size is a compile-time constant, so
+# its compiler knows the payload loop's trip count and the threshold; the
+# current program takes both at run time and its compiler does not. The kernel
+# carries PIN_ macros that put those back, and this build turns them on, so the
+# difference between arm B and arm E is what the run-time parameters cost. The
+# threshold is floor(alpha * signature length) with the swept alpha of 0.8, so
+# it is derived here rather than typed.
+THRESHOLD=$(awk -v l="$LEN" 'BEGIN { printf "%d", int(0.8 * l) }')
+PINNED=App2/smith_waterman_dpi-$TAG-pinned
+${NVCC:-nvcc} -O3 -gencode arch=compute_$ARCHES,code=sm_$ARCHES \
+    -DPIN_SIGNATURES=$SIGS -DPIN_PAYLOAD=$PAY -DPIN_THRESHOLD=$THRESHOLD \
+    -DPIN_EXIT_FIRST=1 App2/smith_waterman_dpi.cu \
+    ${NVML_LIBS:--lnvidia-ml -lpthread} -o "$PINNED" || exit 1
+
+echo "Built $NEW, $PINNED and $OLD"
+echo
+
+# Registers and spills, from the compiler rather than from a run. A kernel that
+# spills to local memory is slower for a reason the timings alone cannot show,
+# and the two programs can differ there without differing anywhere else.
+echo "Register use for sm_$ARCHES, from ptxas:"
+for src in "$OLD_SRC" App2/smith_waterman_dpi.cu; do
+    echo "  $src"
+    ${NVCC:-nvcc} -O3 -gencode arch=compute_$ARCHES,code=sm_$ARCHES \
+        -Xptxas -v -c "$src" -o /dev/null 2>&1 \
+        | sed -n 's/^ptxas info *: *\(Used.*\)/      \1/p;s/^ptxas info *: *\(Function properties for .*\)/    \1/p' \
+        | head -20
+done
 echo
 
 # ---------------------------------------------------------------------------
@@ -164,15 +192,15 @@ done
 echo
 
 # ---------------------------------------------------------------------------
-# new_arm <label> <outfile> <block> <trials> <warmup>
+# new_arm <label> <outfile> <block> <trials> <warmup> <binary>
 new_arm() {
-    label=$1; out=$2; block=$3; trials=$4; warmup=$5
+    label=$1; out=$2; block=$3; trials=$4; warmup=$5; bin=${6:-$NEW}
     : > "$out"
     for i in $(seq 1 $REPS); do
         # No --verify here, so every arm runs with the same default the sweep
         # ran with. Verification happens on the host after the kernel and is
         # outside the timed window in any case.
-        t=$(./$NEW --signatures $SIGS --payload $PAY --sig-len $LEN \
+        t=$(./$bin --signatures $SIGS --payload $PAY --sig-len $LEN \
                 --mode literal --rows registers --dpx on --block $block \
                 --trials $trials --warmup $warmup 2>&1 \
             | sed -n 's/^# kernel_s  *mean \([0-9.]*\) .*/\1/p')
@@ -203,6 +231,12 @@ echo "=============================================================="
 new_arm D "$SCRATCH/D.times" 32 5 1
 echo
 
+echo "=============================================================="
+echo "Arm E: the current program pinned, cold single launch, block 64"
+echo "=============================================================="
+new_arm E "$SCRATCH/E.times" 64 1 0 "$PINNED"
+echo
+
 # ---------------------------------------------------------------------------
 echo "=============================================================="
 echo "What happened"
@@ -211,6 +245,7 @@ report "A original, cold, block 64" "$SCRATCH/A.times"
 report "B current, cold, block 64" "$SCRATCH/B.times"
 report "C current, cold, block 32" "$SCRATCH/C.times"
 report "D current, swept protocol" "$SCRATCH/D.times"
+report "E current pinned, cold, block 64" "$SCRATCH/E.times"
 echo
 
 ratio() {   # ratio <label> <numerator file> <denominator file>
@@ -226,12 +261,21 @@ ratio() {   # ratio <label> <numerator file> <denominator file>
 ratio "B over A, what the current program costs" "$SCRATCH/B.times" "$SCRATCH/A.times"
 ratio "C over B, what 32 threads per block costs" "$SCRATCH/C.times" "$SCRATCH/B.times"
 ratio "D over C, what a warm clock is worth" "$SCRATCH/D.times" "$SCRATCH/C.times"
+ratio "E over A, the pinned build against the original" "$SCRATCH/E.times" "$SCRATCH/A.times"
+ratio "B over E, what the run-time parameters cost" "$SCRATCH/B.times" "$SCRATCH/E.times"
 ratio "D over A, the swept number against the original" "$SCRATCH/D.times" "$SCRATCH/A.times"
 echo
 echo "  B over A is the figure the comparison rests on. On the H200 it measured"
-echo "  3.2 percent. A number of that order here means the two programs measure"
-echo "  the same thing on this card and nothing needs a caveat; a large one"
-echo "  means this card's numbers carry the current program's cost, not the"
-echo "  card's, and every cross-chip ratio has to say so."
+echo "  3.1 percent, on the A100 73.3 percent, both on 2026-09-09, so the two"
+echo "  cards do not carry the same program cost and every cross-chip ratio is"
+echo "  inflated by the difference between them."
+echo
+echo "  E and the two ratios around it say whether that difference is the"
+echo "  run-time parameters. The original's problem size is known to its"
+echo "  compiler and the current program's is not, so the payload loop's trip"
+echo "  count and the threshold are constants in one and registers in the"
+echo "  other. If E lands near A, that is the whole story and pinning the"
+echo "  reported build fixes it. If E stays near B, the cost is somewhere else"
+echo "  and the register report above is the next place to look."
 echo
 echo "  Nothing here is appended to any csv. Copy this output into the notes."

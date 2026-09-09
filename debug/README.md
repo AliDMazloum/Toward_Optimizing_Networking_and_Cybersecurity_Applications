@@ -123,15 +123,23 @@ program was measured on both. If the current program costs a few percent on one
 card and a great deal on the other, that difference lands in the ratio and reads
 as a property of the hardware.
 
-The comparison needs care, because three effects can masquerade as each other.
+The comparison needs care, because several effects can masquerade as each other.
 The original has no trial loop and its warm-up is commented out, so it measures
 a cold launch, and comparing that against a warm mean would charge the clock
 state to the program. It also launches 64 threads per block where the sweep uses
-32, so a block-size difference would be charged to the program too. Four arms
-separate them: the original cold, the current cold at the original's block size,
-the current cold at the swept block size, and the current under the swept
-protocol. The first ratio is the one the comparison rests on; the others say
-what the remaining difference is made of.
+32, so a block-size difference would be charged to the program too. And the
+original's problem size is a compile-time constant, so its compiler knows the
+payload loop's trip count and the detection threshold, while the current
+program takes both at run time. Five arms separate those: the original cold, the
+current cold at the original's block size, the current cold at the swept block
+size, the current under the swept protocol, and the current built with the
+`PIN_` macros that put the run-time parameters back into constants. The first
+ratio is the one the comparison rests on; the others say what the remaining
+difference is made of.
+
+The script also prints what ptxas reports for both sources, registers per thread
+and any spill to local memory, because a kernel that spills is slower for a
+reason no timing can show.
 
 The original writes a signatures file of about 160 MB into its working directory
 on every run, so each arm runs in a scratch directory that is deleted at the
