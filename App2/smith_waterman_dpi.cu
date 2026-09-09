@@ -384,7 +384,7 @@ __device__ __forceinline__ void claim_report(Report *r, int score, int sig, int 
 // mode shares one threshold because every signature has the same length.
 // ---------------------------------------------------------------------------
 
-template <int SIG_LEN, bool USE_DPX, bool ROWS_REG, bool REGEX>
+template <int SIG_LEN, bool USE_DPX, bool ROWS_REG, bool REGEX, bool EXIT_FIRST>
 __global__ void sw_scan(int midpoint, int payload_len,
                         const char *__restrict__ signatures,
                         uint32_t *rows, long long row_size,
@@ -395,7 +395,9 @@ __global__ void sw_scan(int midpoint, int payload_len,
     // -DPIN_PAYLOAD=512 -DPIN_THRESHOLD=12 -DPIN_EXIT_FIRST=1 turns these
     // parameters into constants the compiler can optimize against. The host
     // refuses flags that contradict a pin, so a pinned binary cannot measure
-    // the wrong configuration. An unpinned build is unaffected.
+    // the wrong configuration. An unpinned build is unaffected. Measured on
+    // both cards: none of them changes the generated code except the exit
+    // flag, which is why that one is handled below instead, for every build.
 #ifdef PIN_SIGNATURES
     midpoint = (int)((long long)PIN_SIGNATURES / 2);
 #endif
@@ -407,6 +409,27 @@ __global__ void sw_scan(int midpoint, int payload_len,
 #endif
 #ifdef PIN_EXIT_FIRST
     exit_first = (PIN_EXIT_FIRST != 0);
+#endif
+
+    // Whether the early exit is decided at compile time or at run time is an
+    // architecture choice, and it was measured rather than assumed.
+    //
+    // The exit is a return from inside the unrolled inner loop. With a
+    // run-time predicate the compiler cannot prove the loop runs to
+    // completion, so it keeps the row registers live across every possible
+    // exit and the unroll's allocation collapses. On Ampere that costs 47
+    // registers, 126 against 79, and the kernel runs 1.80 times slower;
+    // deciding the same branch at compile time restores both exactly. On
+    // Hopper the register count barely moves and the run-time form is the
+    // faster of the two by 5.6 percent, so it is what runs there. Each
+    // architecture takes whichever form is faster on it, and the two agree on
+    // what they compute: EXIT_FIRST is instantiated from the same value the
+    // run-time argument carries.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    const bool exit_now = EXIT_FIRST;
+    (void)exit_first;
+#else
+    const bool exit_now = exit_first;
 #endif
 
     const int gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -494,18 +517,18 @@ __global__ void sw_scan(int midpoint, int payload_len,
             if (REGEX) {
                 if (t0 >= thr0) {
                     claim_report(report, t0, gid, i - 1);
-                    if (exit_first) return;
+                    if (exit_now) return;
                 } else if (t1 >= thr1) {
                     claim_report(report, t1, gid + midpoint, i - 1);
-                    if (exit_first) return;
+                    if (exit_now) return;
                 }
             } else {
                 if (b0 > thr0) {
                     claim_report(report, b0, gid, i - 1);
-                    if (exit_first) return;
+                    if (exit_now) return;
                 } else if (b1 > thr1) {
                     claim_report(report, b1, gid + midpoint, i - 1);
-                    if (exit_first) return;
+                    if (exit_now) return;
                 }
             }
         }
@@ -736,22 +759,35 @@ template <int SIG_LEN>
 static void launch_sig_len(bool use_dpx, bool rows_reg, bool regex_mode,
                            int grid, int block, const LaunchArgs *a)
 {
-#define SW_LAUNCH(D, R, X)                                                     \
-    sw_scan<SIG_LEN, D, R, X><<<grid, block>>>(                                \
+// The early-exit flag is a template parameter as well as a run-time argument,
+// because Ampere needs it decided at compile time and Hopper is faster with it
+// decided at run time; the kernel picks per architecture and the reason is
+// recorded there. Both are passed, from the same value, so the two paths agree
+// on what they compute. This doubles the instantiations to sixteen per
+// signature length, which costs compile time and nothing else.
+#define SW_LAUNCH(D, R, X, E)                                                  \
+    sw_scan<SIG_LEN, D, R, X, E><<<grid, block>>>(                             \
         a->midpoint, a->payload_len, a->signatures_d, a->rows_d, a->row_size,  \
         a->thresholds_d, a->threshold_lit, a->exit_first, a->report_d)
 
+#define SW_LAUNCH_X(D, R, X)                                                   \
+    do {                                                                       \
+        if (a->exit_first) SW_LAUNCH(D, R, X, true);                           \
+        else               SW_LAUNCH(D, R, X, false);                          \
+    } while (0)
+
     if (use_dpx) {
-        if (rows_reg) { if (regex_mode) SW_LAUNCH(true, true, true);
-                        else            SW_LAUNCH(true, true, false); }
-        else          { if (regex_mode) SW_LAUNCH(true, false, true);
-                        else            SW_LAUNCH(true, false, false); }
+        if (rows_reg) { if (regex_mode) SW_LAUNCH_X(true, true, true);
+                        else            SW_LAUNCH_X(true, true, false); }
+        else          { if (regex_mode) SW_LAUNCH_X(true, false, true);
+                        else            SW_LAUNCH_X(true, false, false); }
     } else {
-        if (rows_reg) { if (regex_mode) SW_LAUNCH(false, true, true);
-                        else            SW_LAUNCH(false, true, false); }
-        else          { if (regex_mode) SW_LAUNCH(false, false, true);
-                        else            SW_LAUNCH(false, false, false); }
+        if (rows_reg) { if (regex_mode) SW_LAUNCH_X(false, true, true);
+                        else            SW_LAUNCH_X(false, true, false); }
+        else          { if (regex_mode) SW_LAUNCH_X(false, false, true);
+                        else            SW_LAUNCH_X(false, false, false); }
     }
+#undef SW_LAUNCH_X
 #undef SW_LAUNCH
 }
 

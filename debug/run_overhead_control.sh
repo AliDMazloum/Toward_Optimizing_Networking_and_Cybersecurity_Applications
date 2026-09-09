@@ -352,17 +352,18 @@ printf '%s\n' "$PIN_SETS" | while IFS=';' read -r pinlabel pinflags; do
 done
 echo
 
-echo "  B over A is the figure the comparison rests on. Measured 2026-09-09:"
-echo "  3.1 percent on the H200 and 78 percent on the A100, so the two cards"
-echo "  do not carry the same program cost and every cross-chip ratio is"
-echo "  inflated by the difference between them."
+echo "  B over A is the figure the comparison rests on. It measured 3.1 percent"
+echo "  on the H200 and 78.4 percent on the A100 before the early-exit flag was"
+echo "  made an architecture choice, and the cause was traced to that flag"
+echo "  alone: pinning it took the A100 from 126 registers to 79 and from"
+echo "  1.1307 s to 0.6283 s, while pinning the signature count, the payload"
+echo "  length or the threshold changed nothing."
 echo
-echo "  The pin arms say where that cost lives. Pinning all four parameters"
-echo "  brings the A100 to within 1.4 percent of the original, so it is the"
-echo "  run-time parameters and nothing else; pinning the payload length alone"
-echo "  changed neither the timing nor a single register count. One of the"
-echo "  remaining three is therefore the whole cost, and the arm that lands"
-echo "  near A names it. The register lines above say whether it works by"
-echo "  freeing registers or by some other route."
+echo "  So on a build carrying that change, B over A should now read near zero"
+echo "  on the A100, its register line should read 79 rather than 126, and the"
+echo "  H200 should be exactly where it was, because only architectures below"
+echo "  sm_90 take the compile-time form. The pin arms should now differ from"
+echo "  B by nothing on the A100, since the flag is already decided there."
+echo "  Anything else means the change did not do what it was measured to do."
 echo
 echo "  Nothing here is appended to any csv. Copy this output into the notes."
