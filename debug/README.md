@@ -82,3 +82,54 @@ not exist is created with its header, a file carrying the right header is
 appended to, and a file whose header is one column short is refused with the
 file left byte for byte unchanged. It works inside a temporary directory and
 touches nothing else.
+
+## run_scalefree_app1.sh
+
+Sweeps App1 over the generated Barabasi-Albert graph on one machine,
+unattended, in one command.
+
+    ./debug/run_scalefree_app1.sh h200
+    ./debug/run_scalefree_app1.sh a100
+    ./debug/run_scalefree_app1.sh epyc
+
+Each stage is independent and a failure in one does not stop the rest, because
+this is meant to be started and left. The summary at the end says which stages
+produced a file and how many rows, so a partial session is obvious rather than
+silent, and a stage that stopped leaves the rows it had already written, which
+are sound. Re-running appends rather than repeating what finished.
+
+Verification is switched off on the CPU stages, deliberately: on that path the
+reference and the measurement are the same host triple loop on the same input,
+so the check would compare it against itself. The GPU stages keep it on, and on
+a generated graph, which has no closed-form distance oracle, that check runs the
+host loop once per invocation. That is where the correctness evidence for this
+application comes from, and it costs about 100 s per invocation at 24,000 nodes.
+
+## run_overhead_control.sh
+
+Measures what the current App2 program costs against the original one, at the
+single configuration where the two can be compared: the original's problem size
+is fixed at compile time to 10,000,000 signatures, a 512 byte payload and 16
+byte signatures, which is one point of the current program's sweep.
+
+    ./debug/run_overhead_control.sh a100
+    ./debug/run_overhead_control.sh h200
+
+This matters because every ratio taken between two cards assumes the same
+program was measured on both. If the current program costs a few percent on one
+card and a great deal on the other, that difference lands in the ratio and reads
+as a property of the hardware.
+
+The comparison needs care, because three effects can masquerade as each other.
+The original has no trial loop and its warm-up is commented out, so it measures
+a cold launch, and comparing that against a warm mean would charge the clock
+state to the program. It also launches 64 threads per block where the sweep uses
+32, so a block-size difference would be charged to the program too. Four arms
+separate them: the original cold, the current cold at the original's block size,
+the current cold at the swept block size, and the current under the swept
+protocol. The first ratio is the one the comparison rests on; the others say
+what the remaining difference is made of.
+
+The original writes a signatures file of about 160 MB into its working directory
+on every run, so each arm runs in a scratch directory that is deleted at the
+end. Nothing is appended to any csv.
