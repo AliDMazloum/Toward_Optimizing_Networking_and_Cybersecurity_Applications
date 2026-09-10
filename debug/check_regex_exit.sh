@@ -237,13 +237,23 @@ run_arm() {   # run_arm <binary> <output file>
         >> "$2"
 }
 
-# The node was free when the run started, because the guard above insisted on
+# The card was free when the run started, because the guard above insisted on
 # it. It can stop being free at any point after that, so the count is taken
 # again between arms and the largest is reported.
+#
+# The count has to be scoped to the card being measured, exactly as the guard
+# is. Counting the node instead reports every job on every other card as though
+# it had arrived on this one, which on a shared node means the warning fires on
+# every run and stops meaning anything.
 busy_peak=0
 note_busy() {
     local n
-    n=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)
+    if [ -n "${uuid:-}" ]; then
+        n=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader \
+            2>/dev/null | grep -c "$uuid")
+    else
+        n=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)
+    fi
     [ "$n" -gt "$busy_peak" ] && busy_peak=$n
     return 0
 }
@@ -273,8 +283,8 @@ echo
 # so anything at all is somebody else's.
 if [ "$busy_peak" -gt 0 ]; then
     echo "  WARNING: up to $busy_peak foreign compute process(es) appeared on"
-    echo "  this node during the run, after the guard let it start, so the"
-    echo "  readings below are of a shared card."
+    echo "  the measured card during the run, after the guard let it start, so"
+    echo "  the readings below are of a shared card."
     echo
 fi
 
