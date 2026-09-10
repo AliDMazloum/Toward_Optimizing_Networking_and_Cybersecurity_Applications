@@ -395,9 +395,7 @@ __global__ void sw_scan(int midpoint, int payload_len,
     // -DPIN_PAYLOAD=512 -DPIN_THRESHOLD=12 -DPIN_EXIT_FIRST=1 turns these
     // parameters into constants the compiler can optimize against. The host
     // refuses flags that contradict a pin, so a pinned binary cannot measure
-    // the wrong configuration. An unpinned build is unaffected. Measured on
-    // both cards: none of them changes the generated code except the exit
-    // flag, which is why that one is handled below instead, for every build.
+    // the wrong configuration. An unpinned build is unaffected.
 #ifdef PIN_SIGNATURES
     midpoint = (int)((long long)PIN_SIGNATURES / 2);
 #endif
@@ -411,32 +409,18 @@ __global__ void sw_scan(int midpoint, int payload_len,
     exit_first = (PIN_EXIT_FIRST != 0);
 #endif
 
-    // Whether the early exit is decided at compile time or at run time is a
-    // property of the kernel variant, and every case below was measured rather
-    // than assumed. The two forms agree on what they compute: EXIT_FIRST is
-    // instantiated from the same value the run-time argument carries, so this
-    // chooses only how the branch is compiled.
+    // The early exit is a return from inside the unrolled inner loop, and its
+    // predicate is available two ways: as the run-time argument and as the
+    // template parameter it was instantiated from. They always carry the same
+    // value, so this chooses only how the branch is compiled.
     //
-    // The exit is a return from inside the unrolled inner loop. With a
-    // run-time predicate the compiler cannot prove the loop runs to
-    // completion, so it keeps the row registers live across every possible
-    // exit and the unroll's allocation suffers. How much that costs depends on
-    // the variant:
-    //
-    //   Ampere, literal   126 registers against 79, and 1.80x slower over the
-    //                     whole sweep, up to 1.99x at the longer signature.
-    //                     Decided at compile time.
-    //   Ampere, regex     already at lower register pressure, because the
-    //                     regex step spends its registers elsewhere. Deciding
-    //                     the branch at compile time made it 5 to 8 percent
-    //                     slower at (1024, 32) and did nothing at (512, 16),
-    //                     so it keeps the run-time form.
-    //   Hopper, both      the register count barely moves and the run-time
-    //                     form is faster, by 5.6 percent on the literal path.
-    //                     Kept everywhere.
-    //
-    // The rule is one sentence: each variant compiles the branch whichever way
-    // is faster for it, and none of them is allowed to be slower than it was.
+    // It matters because a run-time predicate leaves the compiler unable to
+    // prove the inner loop runs to completion, so it keeps the row registers
+    // live across every possible exit and the unroll's register allocation
+    // suffers. Which form is faster depends on the architecture and on the
+    // mode, so each variant takes the one that is faster for it: the literal
+    // path below sm_90 uses the template parameter, everything else uses the
+    // argument.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
     const bool exit_now = REGEX ? exit_first : EXIT_FIRST;
 #else
@@ -770,12 +754,10 @@ template <int SIG_LEN>
 static void launch_sig_len(bool use_dpx, bool rows_reg, bool regex_mode,
                            int grid, int block, const LaunchArgs *a)
 {
-// The early-exit flag is a template parameter as well as a run-time argument,
-// because Ampere needs it decided at compile time and Hopper is faster with it
-// decided at run time; the kernel picks per architecture and the reason is
-// recorded there. Both are passed, from the same value, so the two paths agree
-// on what they compute. This doubles the instantiations to sixteen per
-// signature length, which costs compile time and nothing else.
+// The early-exit flag is passed twice, as a template parameter and as a
+// run-time argument, from the same value. The kernel chooses which of the two
+// its branch reads, for the reason recorded there. This doubles the
+// instantiations to sixteen per signature length, which costs compile time.
 #define SW_LAUNCH(D, R, X, E)                                                  \
     sw_scan<SIG_LEN, D, R, X, E><<<grid, block>>>(                             \
         a->midpoint, a->payload_len, a->signatures_d, a->rows_d, a->row_size,  \
