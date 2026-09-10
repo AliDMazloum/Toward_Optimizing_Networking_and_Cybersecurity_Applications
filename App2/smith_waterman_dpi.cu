@@ -282,8 +282,8 @@ static void power_dump_csv(const char *path)
 //
 // Three details of the recurrence:
 //
-//   - scanning starts at the second payload character, so payload byte 0
-//     never enters the recurrence,
+//   - scanning starts at the first payload character, so every payload byte
+//     enters the recurrence,
 //   - literal mode tests the BASE value (the max of the three neighbours)
 //     against its threshold with strict greater-than,
 //   - regex mode tests the newly computed cell with greater-or-equal against
@@ -460,8 +460,12 @@ __global__ void sw_scan(int midpoint, int payload_len,
 
     bool even = false;
 
-    // i starts at 2: payload byte 0 is never scored.
-    for (int i = 2; i <= payload_len; i++) {
+    // i starts at 1, so payload byte 0 is scored like every other byte. The
+    // loop bound is a compile-time-friendly constant start rather than a
+    // parameter, deliberately: a run-time loop start would leave the compiler
+    // unable to bound the trip count, which is the same thing that cost this
+    // kernel its register allocation once already.
+    for (int i = 1; i <= payload_len; i++) {
         const char p = c_payload[i - 1];
         const bool pdig = REGEX ? is_ascii_digit(p) : false;
         even = !even;
@@ -535,7 +539,7 @@ __global__ void sw_scan(int midpoint, int payload_len,
 //
 // The same recurrence on the host, one signature at a time, through the same
 // score-step functions the kernel uses, with the same detection semantics:
-// payload byte 0 unscored, literal tested on the base with strict >, regex
+// every payload byte scored, literal tested on the base with strict >, regex
 // tested on the new cell with >=. Returns true at the first threshold
 // crossing with its score and position, which for a given signature is
 // deterministic, so a reported detection must reproduce exactly. When nothing
@@ -550,7 +554,10 @@ static bool host_scan_signature(bool regex_mode, const char *payload, int P,
     int cur[MAX_SIG_LEN + 1]  = { 0 };
     int best = 0;
 
-    for (int i = 2; i <= P; i++) {
+    // Starts at 1 for the same reason as the kernel, and must match it: this is
+    // the reference every reported crossing is checked against, so a difference
+    // of one column here would report itself as a mismatch on every trial.
+    for (int i = 1; i <= P; i++) {
         const char p = payload[i - 1];
         const bool pdig = is_ascii_digit(p);
         cur[0] = 0;
@@ -1165,9 +1172,10 @@ int main(int argc, char **argv)
         if (regex_mode) {
             const char *sig_text = (L == SIG_LEN_B) ? REGEX_SIG_32 : REGEX_SIG_16;
             const char *pat_text = (L == SIG_LEN_B) ? REGEX_PAT_32 : REGEX_PAT_16;
-            // The payload text is planted at offset 5: payload byte 0 is
-            // never scored, so offset 0 would lose the pattern's first
-            // character.
+            // The payload text is planted at offset 5. Offset 0 would work now
+            // that every byte is scored, but the offset is kept where the
+            // measured program put it so a planted run stays comparable with
+            // every earlier one.
             if ((int)(5 + strlen(pat_text)) > P) {
                 fprintf(stderr, "--payload too short for the planted regex"
                                 " payload text (%zu bytes at offset 5)\n",
@@ -1177,10 +1185,10 @@ int main(int argc, char **argv)
             memcpy(slot_p, sig_text, (size_t)L);     // both texts are exactly L
             memcpy(payload + 5, pat_text, strlen(pat_text));
         } else {
-            // The planted signature's text becomes the start of the payload.
-            // Payload byte 0 is never scored, so the usable match is L - 1
-            // characters and the plant is detected for alpha up to about
-            // (L - 2) / L.
+            // The planted signature's text becomes the start of the payload,
+            // and every one of its L characters scores, so a perfect plant
+            // reaches L. The test is strict against floor(alpha * L), so it is
+            // detected at every alpha below 1.0.
             memcpy(payload, slot_p, (size_t)L);
         }
     }
@@ -1330,9 +1338,8 @@ int main(int argc, char **argv)
         printf("# threshold         : base score > %d, of a maximum %d\n",
                threshold_lit, L);
     }
-    printf("# cell_updates      : %.0f per trial (payload bytes 1..%d;"
-           " byte 0 is never scored)\n",
-           (double)N * (double)(P - 1) * (double)L, P - 1);
+    printf("# cell_updates      : %.0f per trial (every payload byte, 0..%d)\n",
+           (double)N * (double)P * (double)L, P - 1);
     printf("# target            : %s\n", run_cpu ? "cpu" : "gpu");
     if (run_cpu)
         printf("# cpu_run           : %s\n", cpu_desc());
