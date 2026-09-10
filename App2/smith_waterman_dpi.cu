@@ -411,23 +411,34 @@ __global__ void sw_scan(int midpoint, int payload_len,
     exit_first = (PIN_EXIT_FIRST != 0);
 #endif
 
-    // Whether the early exit is decided at compile time or at run time is an
-    // architecture choice, and it was measured rather than assumed.
+    // Whether the early exit is decided at compile time or at run time is a
+    // property of the kernel variant, and every case below was measured rather
+    // than assumed. The two forms agree on what they compute: EXIT_FIRST is
+    // instantiated from the same value the run-time argument carries, so this
+    // chooses only how the branch is compiled.
     //
     // The exit is a return from inside the unrolled inner loop. With a
     // run-time predicate the compiler cannot prove the loop runs to
     // completion, so it keeps the row registers live across every possible
-    // exit and the unroll's allocation collapses. On Ampere that costs 47
-    // registers, 126 against 79, and the kernel runs 1.80 times slower;
-    // deciding the same branch at compile time restores both exactly. On
-    // Hopper the register count barely moves and the run-time form is the
-    // faster of the two by 5.6 percent, so it is what runs there. Each
-    // architecture takes whichever form is faster on it, and the two agree on
-    // what they compute: EXIT_FIRST is instantiated from the same value the
-    // run-time argument carries.
+    // exit and the unroll's allocation suffers. How much that costs depends on
+    // the variant:
+    //
+    //   Ampere, literal   126 registers against 79, and 1.80x slower over the
+    //                     whole sweep, up to 1.99x at the longer signature.
+    //                     Decided at compile time.
+    //   Ampere, regex     already at lower register pressure, because the
+    //                     regex step spends its registers elsewhere. Deciding
+    //                     the branch at compile time made it 5 to 8 percent
+    //                     slower at (1024, 32) and did nothing at (512, 16),
+    //                     so it keeps the run-time form.
+    //   Hopper, both      the register count barely moves and the run-time
+    //                     form is faster, by 5.6 percent on the literal path.
+    //                     Kept everywhere.
+    //
+    // The rule is one sentence: each variant compiles the branch whichever way
+    // is faster for it, and none of them is allowed to be slower than it was.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
-    const bool exit_now = EXIT_FIRST;
-    (void)exit_first;
+    const bool exit_now = REGEX ? exit_first : EXIT_FIRST;
 #else
     const bool exit_now = exit_first;
 #endif

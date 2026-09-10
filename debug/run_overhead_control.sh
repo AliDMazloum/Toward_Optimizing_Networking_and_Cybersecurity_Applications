@@ -171,7 +171,7 @@ echo
 # is about 13 percent occupancy, so it stands to gain more from anything that
 # frees registers, and no arm here times it. Printing both means a rebuild
 # shows whether it gained.
-WANT="dpx 1, regrows 1, regex 0,"
+WANT="dpx 1, regrows 1,"
 
 regs_from() {   # regs_from <build log> <label>
     awk -v want="$WANT" -v tag="$2" '
