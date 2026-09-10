@@ -188,12 +188,16 @@ Reading this
 The true positive rate is a property of what was planted, and the two modes
 plant different things, so they answer different questions.
 
-In literal mode the planted signature's own text is copied into the payload,
-which scores one less than its length because payload byte 0 is never scored.
-So it is detected while alpha stays below about (L-2)/L, that is 0.875 at
-length 16 and 0.9375 at length 32, and the false negatives above that are the
-threshold refusing a match that is one character short of perfect rather than
-the detector failing.
+In literal mode the planted signature's own text is copied into the payload and
+every one of its characters scores, so a perfect plant reaches its full length.
+The test is strict against floor(alpha * L), so it is detected at every alpha
+below 1.0 and the true positive rate should be 1 throughout. A false negative
+below alpha 1.0 means something is wrong, not that the threshold was strict.
+
+That was not always so. The payload loop used to start at the second byte, so
+the plant could reach only L-1 and nothing cleared alpha 0.95 at length 16. If
+this table shows a true positive rate under 1 at a high alpha, check that the
+binary is newer than that change rather than looking for a cause in the data.
 
 In regex mode the planted signature contains wildcards, and the scoring rule
 requires a signature with any wildcard to reach its full literal score. Alpha
