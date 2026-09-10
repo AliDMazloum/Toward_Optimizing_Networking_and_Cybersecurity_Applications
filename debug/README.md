@@ -145,6 +145,40 @@ The original writes a signatures file of about 160 MB into its working directory
 on every run, so each arm runs in a scratch directory that is deleted at the
 end. Nothing is appended to any csv.
 
+## run_detection_quality.sh
+
+Measures how often the detector fires on a payload carrying a planted signature
+and how often it fires on one that does not, as a curve over the threshold and
+over the alphabet the synthetic data is drawn from.
+
+    ./debug/run_detection_quality.sh h200
+    SEEDS=20 ./debug/run_detection_quality.sh h200      a short rehearsal first
+
+The alphabet is swept rather than fixed because two unrelated strings agree at
+one position with probability one over the alphabet size, so a false positive
+rate over 26 lowercase letters is roughly ten times the rate over the whole byte
+range. Quoting one alphabet would state a result about the generator rather than
+about the detector; quoting three states what a change of traffic would do, which
+is the part that carries over to traffic nobody generated.
+
+One run contributes one payload and one bit, so every rate is a count over seeds
+and its resolution is one over the seed count. The alpha loop cannot be
+collapsed: the scores do not depend on the threshold but the decision does, and
+the program reports the first crossing rather than the largest score, so a
+crossing at a low threshold says nothing about a high one.
+
+Every run keeps `--verify report` on, so if the device and the host reference
+ever disagreed about a score the mismatch column would say so in the data rather
+than the rates quietly being wrong.
+
+It refuses to overwrite its output and appends to nothing. Unlike the sweeps it
+does not refuse a busy card, deliberately: it measures which payloads are
+detected rather than how long anything takes, and a detection is the same
+detection on a shared card. `SWEEP_GPU` still pins it out of the way. It prints
+the confusion matrix at the end, and a closing section saying how to read it,
+including why the true positive rate in regex mode is 1 at every threshold by
+construction.
+
 ## check_regex_exit.sh
 
 Decides why one sweep came out slower than an earlier sweep of the same

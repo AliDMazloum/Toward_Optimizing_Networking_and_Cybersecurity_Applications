@@ -687,16 +687,77 @@ static const char *cpu_desc(void)
 // ---------------------------------------------------------------------------
 // Problem set-up
 //
-// Signatures and payload are random lowercase letters from a seeded generator,
-// so a run is reproducible from its printed settings. Planting a match copies
-// the planted signature's text into the payload (literal mode), or copies a
-// regex and its matching payload text over the planted slots (regex mode),
-// one pair per supported signature length.
+// Signatures and payload are random bytes from a seeded generator, so a run is
+// reproducible from its printed settings. Planting a match copies the planted
+// signature's text into the payload (literal mode), or copies a regex and its
+// matching payload text over the planted slots (regex mode), one pair per
+// supported signature length.
+//
+// The alphabet those bytes come from is a run-time choice rather than a
+// constant, because how often two unrelated strings agree by chance is set by
+// it: a chance agreement at one position has probability one over the alphabet
+// size. Any false positive figure is therefore a statement about the alphabet
+// as much as about the detector, so the alphabet is named wherever one is
+// reported. The default stays at the 26 letters every timing sweep has used, so
+// those remain reproducible, and the detection work varies it deliberately.
+//
+// Two interactions to keep in mind when comparing across alphabets. The larger
+// alphabets contain the three regex metacharacters, so in regex mode a random
+// signature can acquire a wildcard and fall under the full-literal-score rule
+// instead of the alpha rule. And a signature drawn from the whole byte range can
+// contain a zero byte, which nothing here treats as a terminator, because every
+// length is carried explicitly.
 // ---------------------------------------------------------------------------
 
-static void fill_random_lowercase(char *dst, int n)
+typedef enum {
+    ALPHABET_LOWER26,    // 'a' to 'z'
+    ALPHABET_ASCII95,    // printable ASCII, 0x20 to 0x7e
+    ALPHABET_BYTES256    // the whole byte range
+} Alphabet;
+
+static Alphabet g_alphabet = ALPHABET_LOWER26;
+
+static const char *alphabet_name(Alphabet a)
 {
-    for (int i = 0; i < n; i++) dst[i] = (char)(rand() % 26 + 'a');
+    switch (a) {
+        case ALPHABET_ASCII95:  return "ascii95";
+        case ALPHABET_BYTES256: return "bytes256";
+        default:                return "lower26";
+    }
+}
+
+static int alphabet_size(Alphabet a)
+{
+    switch (a) {
+        case ALPHABET_ASCII95:  return 95;
+        case ALPHABET_BYTES256: return 256;
+        default:                return 26;
+    }
+}
+
+// Returns false for an unknown name, so the caller reports it rather than
+// silently measuring a different alphabet from the one that was asked for.
+static bool alphabet_from_name(const char *s, Alphabet *out)
+{
+    if (!strcmp(s, "lower26"))  { *out = ALPHABET_LOWER26;  return true; }
+    if (!strcmp(s, "ascii95"))  { *out = ALPHABET_ASCII95;  return true; }
+    if (!strcmp(s, "bytes256")) { *out = ALPHABET_BYTES256; return true; }
+    return false;
+}
+
+static void fill_random_bytes(char *dst, int n)
+{
+    switch (g_alphabet) {
+        case ALPHABET_ASCII95:
+            for (int i = 0; i < n; i++) dst[i] = (char)(rand() % 95 + 0x20);
+            break;
+        case ALPHABET_BYTES256:
+            for (int i = 0; i < n; i++) dst[i] = (char)(rand() % 256);
+            break;
+        default:
+            for (int i = 0; i < n; i++) dst[i] = (char)(rand() % 26 + 'a');
+            break;
+    }
 }
 
 // Each signature reaches its full literal score against its payload text, so
@@ -898,6 +959,12 @@ static void print_usage(const char *prog)
     printf("  --csv <path>        append one row per trial to this file\n");
     printf("  --power-csv <path>  write every power sample to this file\n");
     printf("  --seed <int>        seed for the generated data (default 1)\n");
+    printf("  --alphabet <name>   bytes the generated signatures and payload\n");
+    printf("                      are drawn from: lower26 | ascii95 | bytes256\n");
+    printf("                      (default lower26, the 26 lowercase letters,\n");
+    printf("                      which every timing sweep has used). It sets\n");
+    printf("                      how often unrelated strings agree by chance,\n");
+    printf("                      so any false positive rate depends on it.\n");
     printf("  --verify <what>     report | all | off: recheck the reported\n");
     printf("                      signature on the host, additionally scan every\n");
     printf("                      signature on the host, or skip (default report)\n");
@@ -987,6 +1054,13 @@ int main(int argc, char **argv)
             power_csv_path = argv[++i];
         } else if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
             seed = (unsigned int)strtoul(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "--alphabet") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!alphabet_from_name(v, &g_alphabet)) {
+                fprintf(stderr, "Unknown alphabet: %s. One of lower26,"
+                                " ascii95, bytes256.\n", v);
+                return 1;
+            }
         } else if (!strcmp(argv[i], "--verify") && i + 1 < argc) {
             const char *v = argv[++i];
             if (!strcmp(v, "off"))         verify = VERIFY_OFF;
@@ -1081,10 +1155,10 @@ int main(int argc, char **argv)
         return 1;
     }
     for (long long k = 0; k < N; k++) {
-        fill_random_lowercase(signatures + (size_t)k * slot, L);
+        fill_random_bytes(signatures + (size_t)k * slot, L);
         signatures[(size_t)k * slot + L] = '\0';
     }
-    fill_random_lowercase(payload, P);
+    fill_random_bytes(payload, P);
 
     if (plant >= 0) {
         char *slot_p = signatures + (size_t)plant * slot;
@@ -1237,6 +1311,10 @@ int main(int argc, char **argv)
     printf("# payload_bytes     : %d\n", P);
     printf("# sig_len           : %d\n", L);
     printf("# mode              : %s\n", regex_mode ? "regex" : "literal");
+    printf("# alphabet          : %s (%d symbols; a chance agreement at one"
+           " position has probability 1/%d)\n",
+           alphabet_name(g_alphabet), alphabet_size(g_alphabet),
+           alphabet_size(g_alphabet));
     printf("# alpha             : %g\n", alpha);
     if (regex_mode) {
         // Every random signature is all-literal, so any non-planted slot
