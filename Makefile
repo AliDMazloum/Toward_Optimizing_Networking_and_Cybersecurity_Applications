@@ -144,6 +144,15 @@ ALLOW_BUSY ?=
 #
 # With SWEEP_GPU empty the program picks its own device and no index can be
 # checked, so the requirement falls back to the whole node being free.
+#
+# The `\#` below are not decoration and must stay escaped. This is a variable
+# assignment rather than a recipe, and in a variable assignment make treats an
+# unescaped `#` as the start of its own comment, quotes or no quotes. An
+# unescaped one here truncates this variable in the middle of an echo argument
+# and leaves the double quote open, which the shell then reports as an unmatched
+# quote tens of lines later, in whichever recipe used the variable. Recipe lines
+# elsewhere in this file carry bare `#` safely, because make passes those to the
+# shell verbatim.
 BUSY_GUARD = \
 	if [ -n "$(SWEEP_GPU)" ]; then \
 	  uuid=$$(nvidia-smi -i $(SWEEP_GPU) --query-gpu=uuid \
@@ -162,11 +171,11 @@ BUSY_GUARD = \
 	  busy=$$(nvidia-smi --query-compute-apps=pid --format=csv,noheader \
 	          2>/dev/null | wc -l); \
 	fi; \
-	echo "# measuring on: $$where"; \
+	echo "\# measuring on: $$where"; \
 	if [ "$$busy" -gt 0 ]; then \
 	  if [ "$(ALLOW_BUSY)" = "1" ]; then \
-	    echo "# ALLOW_BUSY=1: $$busy other compute process(es) are on that card,"; \
-	    echo "# so these numbers measure a shared card and must be labelled as such"; \
+	    echo "\# ALLOW_BUSY=1: $$busy other compute process(es) are on that card,"; \
+	    echo "\# so these numbers measure a shared card and must be labelled as such"; \
 	  else \
 	    echo "Refusing to sweep: $$busy compute process(es) are already using"; \
 	    echo "that card. A timing run taken beside them measures the sharing,"; \
