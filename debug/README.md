@@ -144,3 +144,30 @@ reason no timing can show.
 The original writes a signatures file of about 160 MB into its working directory
 on every run, so each arm runs in a scratch directory that is deleted at the
 end. Nothing is appended to any csv.
+
+## check_regex_exit.sh
+
+Decides why one sweep came out slower than an earlier sweep of the same
+configuration: because of how the early-exit predicate is compiled, or because
+something else was using the card at the time.
+
+    ./debug/check_regex_exit.sh a100
+    ./debug/check_regex_exit.sh h200
+
+The two explanations are indistinguishable in a results file, which records the
+configuration and nothing about what else the machine was doing, so the
+slowdown has to be reproduced with the two causes separated. One arm passes the
+predicate as a kernel argument and the other builds it into a constant with
+`-DPIN_EXIT_FIRST=1`; one source builds both, so nothing is checked out.
+
+The arms are interleaved rather than run one after the other, because a
+neighbouring job that comes and goes would otherwise land on whichever arm
+happened to be running and would read exactly like a property of the code. What
+else holds memory on the card is recorded before and after as well, since a
+neighbour present for the whole run is invisible to the interleaving.
+
+It also prints the register count of the regex kernel each arm launches. Equal
+counts settle the question without reference to any timing, because identical
+machine code cannot run at two speeds for a reason inside the code. The closing
+section states what each outcome means. It writes no csv and removes its two
+binaries at the end.
