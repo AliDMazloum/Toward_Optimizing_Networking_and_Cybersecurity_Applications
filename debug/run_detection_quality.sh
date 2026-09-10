@@ -58,6 +58,11 @@ esac
 #             and the count has to be quoted with it.
 #   CONFIGS   both (payload, signature length) pairs the reported sweeps use.
 #   ALPHAS    the reported threshold, 0.8, with a spread either side of it.
+#             The threshold the kernel applies is floor(alpha * L), so alpha
+#             steps finer than 1/L land on the same integer and buy nothing:
+#             at length 16 the distinct thresholds are 8/16 through 16/16.
+#             A grid in steps of 1/32 resolves both signature lengths, at
+#             the cost of running longer.
 #   SEEDS     trials per point. The rate resolution is 1/SEEDS.
 #   PLANT     which signature is planted; any index below SIGS will do.
 SIGS=${SIGS:-10000}
@@ -69,7 +74,11 @@ MODES=${MODES:-"literal regex"}
 PLANT=${PLANT:-1356}
 
 BIN=App2/smith_waterman_dpi-$TAG
-OUT=Results/app2_detection_$TAG.csv
+# Overridable, because the useful shape of this experiment is two runs
+# rather than one: a wide alpha grid at moderate seed count to show where
+# the detector turns over, and a deep run at the reported threshold alone
+# to bound the false positive rate there. Those want separate files.
+OUT=${OUT:-Results/app2_detection_$TAG.csv}
 
 name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
 case "$name" in
