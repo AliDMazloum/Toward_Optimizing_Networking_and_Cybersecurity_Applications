@@ -38,7 +38,13 @@
 # Usage, from the root of the clone:
 #
 #   ./debug/check_regex_exit.sh a100
+#   SWEEP_GPU=3 ./debug/check_regex_exit.sh a100      on a shared node
 #   ./debug/check_regex_exit.sh h200
+#
+# On a node shared with other users, find a free card first and name it, using
+# the same variable the sweeps take:
+#
+#   nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv
 #
 # It writes no csv and appends to nothing. Its two binaries are removed at the
 # end, and they carry names of their own, so a sweep binary sitting beside them
@@ -106,26 +112,50 @@ neighbours() {   # neighbours <when>
 neighbours "before"
 echo
 
-# A foreign job anywhere on the node stops the run, rather than being noted and
-# then measured through. Which physical card a foreign process sits on cannot be
-# matched against the card this program picks without care, because CUDA and
-# NVML order the devices differently, so the requirement here is the stricter
-# and simpler one: no compute process on the node but this one. That is what a
-# timing measurement needs in any case. Set ALLOW_BUSY=1 to measure anyway,
-# which is worth doing only to show that a busy node is the cause of something.
-foreign=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)
+# A foreign job on the card this check is about stops the run, rather than being
+# noted and then measured through. On a node shared with other users the free
+# card is whichever they are not on, so name it with SWEEP_GPU, using the index
+# nvidia-smi prints. The card is then pinned by its UUID: CUDA and NVML number
+# the devices differently, and an index that names the free card to nvidia-smi
+# can name a busy one to the program, which would defeat the check without
+# saying so. A UUID means the same card to both. Both programs bind their power
+# sampler by PCI bus id taken from the CUDA device, so the energy path follows
+# the same pinning.
+#
+# With SWEEP_GPU unset the program picks its own device and no index can be
+# checked, so the requirement falls back to the whole node being free.
+#
+# ALLOW_BUSY=1 measures anyway, which is worth doing only to show that a busy
+# card is the cause of something.
+if [ -n "${SWEEP_GPU:-}" ]; then
+    uuid=$(nvidia-smi -i "$SWEEP_GPU" --query-gpu=uuid --format=csv,noheader 2>/dev/null)
+    if [ -z "$uuid" ]; then
+        echo "No GPU with index $SWEEP_GPU on this node." >&2
+        exit 1
+    fi
+    export CUDA_VISIBLE_DEVICES=$uuid
+    foreign=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader \
+              2>/dev/null | grep -c "$uuid")
+    echo "Measuring on gpu $SWEEP_GPU, $uuid"
+else
+    foreign=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)
+    echo "Measuring on whichever card CUDA picks, because SWEEP_GPU is not set,"
+    echo "  so the whole node has to be free."
+fi
+echo
+
 if [ "$foreign" -gt 0 ]; then
     if [ "${ALLOW_BUSY:-0}" = "1" ]; then
-        echo "  $foreign compute process(es) already on this node. ALLOW_BUSY=1"
+        echo "  $foreign foreign compute process(es) on that card. ALLOW_BUSY=1"
         echo "  is set, so the run continues, and every number below is a"
         echo "  measurement of a shared card rather than of this program."
         echo
     else
         echo "Refusing to run: $foreign compute process(es) are already using" >&2
-        echo "this node's GPUs, and a timing measurement taken beside them" >&2
-        echo "reports the sharing, not the program. Wait for the node, or set" >&2
-        echo "ALLOW_BUSY=1 to measure anyway and say so wherever the number" >&2
-        echo "is used." >&2
+        echo "that card, and a timing measurement taken beside them reports the" >&2
+        echo "sharing, not the program. Name a free card with SWEEP_GPU=<index>," >&2
+        echo "wait for this one, or set ALLOW_BUSY=1 to measure anyway and say so" >&2
+        echo "wherever the number is used." >&2
         exit 1
     fi
 fi

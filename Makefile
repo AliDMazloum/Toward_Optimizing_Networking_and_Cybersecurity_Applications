@@ -25,6 +25,15 @@
 # target names, so a job landing on the wrong machine fails immediately instead
 # of producing a mislabelled number.
 #
+# A sweep also refuses to run on a card another job is already computing on. On
+# a node shared with other users, find a free card and name it:
+#
+#   nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv
+#   make a100-sweep2 SWEEP_GPU=3
+#
+# The card is then pinned by its UUID, so the card that was checked is provably
+# the card that runs.
+#
 # The general targets underneath take ARCHES and TAG by hand:
 #
 #   make                          build both applications, both architectures
@@ -109,6 +118,71 @@ SWEEP2_CSV     ?= Results/app2_final_$(TAG).csv
 # targets set it; set it to nothing to skip the check.
 GPU_MATCH ?=
 
+# Which GPU a sweep runs on, given as the index nvidia-smi prints. Leave it
+# empty to let CUDA choose, which is right on a machine with one GPU and wrong
+# on a shared one, where the free card is whichever the other users are not on.
+SWEEP_GPU ?=
+
+# Run anyway on a card somebody else is already using. Only for a deliberate
+# measurement of a shared card; a file written under it has to be labelled as
+# one wherever it is used.
+ALLOW_BUSY ?=
+
+# A sweep refuses to start on a card another job is already computing on.
+#
+# A timing measurement taken beside another job reports the sharing rather than
+# the program, and the file it writes cannot be told from a good one afterwards:
+# a results file records the configuration, and the configuration is the same
+# either way. So the check happens before anything is written, and a contended
+# run is prevented rather than detected later.
+#
+# The card is pinned by its UUID rather than by an index. CUDA and NVML number
+# the devices differently, so an index that names the free card to nvidia-smi
+# can name a busy one to the program, which would defeat the check silently.
+# A UUID means the same card to both, and CUDA_VISIBLE_DEVICES accepts one, so
+# the card that is checked is provably the card that runs.
+#
+# With SWEEP_GPU empty the program picks its own device and no index can be
+# checked, so the requirement falls back to the whole node being free.
+BUSY_GUARD = \
+	if [ -n "$(SWEEP_GPU)" ]; then \
+	  uuid=$$(nvidia-smi -i $(SWEEP_GPU) --query-gpu=uuid \
+	          --format=csv,noheader 2>/dev/null); \
+	  if [ -z "$$uuid" ]; then \
+	    echo "No GPU with index $(SWEEP_GPU) on this node."; \
+	    nvidia-smi --query-gpu=index,name --format=csv,noheader | sed 's/^/  /'; \
+	    exit 1; \
+	  fi; \
+	  export CUDA_VISIBLE_DEVICES=$$uuid; \
+	  where="gpu $(SWEEP_GPU), $$uuid"; \
+	  busy=$$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader \
+	          2>/dev/null | grep -c "$$uuid"); \
+	else \
+	  where="every gpu on this node, because SWEEP_GPU is not set"; \
+	  busy=$$(nvidia-smi --query-compute-apps=pid --format=csv,noheader \
+	          2>/dev/null | wc -l); \
+	fi; \
+	echo "# measuring on: $$where"; \
+	if [ "$$busy" -gt 0 ]; then \
+	  if [ "$(ALLOW_BUSY)" = "1" ]; then \
+	    echo "# ALLOW_BUSY=1: $$busy other compute process(es) are on that card,"; \
+	    echo "# so these numbers measure a shared card and must be labelled as such"; \
+	  else \
+	    echo "Refusing to sweep: $$busy compute process(es) are already using"; \
+	    echo "that card. A timing run taken beside them measures the sharing,"; \
+	    echo "not this program, and the file it writes cannot be told from a"; \
+	    echo "good one later. Pick a free card with SWEEP_GPU=<index>, wait for"; \
+	    echo "this one, or pass ALLOW_BUSY=1 to measure anyway and label the"; \
+	    echo "file wherever it is used."; \
+	    nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory \
+	      --format=csv,noheader 2>/dev/null | sed 's/^/  /'; \
+	    echo "  free cards, by nvidia-smi index:"; \
+	    nvidia-smi --query-gpu=index,uuid,utilization.gpu,memory.used \
+	      --format=csv,noheader 2>/dev/null | sed 's/^/    /'; \
+	    exit 1; \
+	  fi; \
+	fi
+
 .PHONY: all app1 app2 check sweep sweep2 clean clean-all help
 .PHONY: a100 a100-app1 a100-app2 a100-check a100-sweep a100-sweep2 a100-clean
 .PHONY: h200 h200-app1 h200-app2 h200-check h200-sweep h200-sweep2 h200-clean
@@ -169,6 +243,7 @@ sweep: $(APP1_TARGETS)
 	       exit 1 ;; \
 	  esac; \
 	fi; \
+	$(BUSY_GUARD); \
 	mkdir -p $(dir $(SWEEP_CSV)) || exit 1; \
 	echo "# writing $(SWEEP_CSV)"; \
 	for n in $(SWEEP_NODES); do \
@@ -194,6 +269,7 @@ sweep2: $(APP2_TARGETS)
 	       exit 1 ;; \
 	  esac; \
 	fi; \
+	$(BUSY_GUARD); \
 	mkdir -p $(dir $(SWEEP2_CSV)) || exit 1; \
 	echo "# writing $(SWEEP2_CSV)"; \
 	for cfg in $(SWEEP2_CONFIGS); do \
@@ -275,6 +351,14 @@ help:
 	@echo "  SWEEP2_SIGS = $(SWEEP2_SIGS)"
 	@echo "  SWEEP2_CSV  = $(SWEEP2_CSV)"
 	@echo "  GPU_MATCH   = $(GPU_MATCH)"
+	@echo "  SWEEP_GPU   = $(SWEEP_GPU)   (nvidia-smi index; empty lets CUDA pick)"
+	@echo "  ALLOW_BUSY  = $(ALLOW_BUSY)   (1 sweeps a card someone else is on)"
+	@echo ""
+	@echo "A sweep refuses to run on a card another job is computing on, because"
+	@echo "the file it would write cannot be told from a good one afterwards. On"
+	@echo "a shared node, name a free card:"
+	@echo "  nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv"
+	@echo "  make a100-sweep2 SWEEP_GPU=3"
 	@echo ""
 	@echo "Binaries this invocation would build:"
 	@echo "  $(TARGETS)"

@@ -13,6 +13,13 @@
 #   ./debug/run_scalefree_app1.sh a100   the A100
 #   ./debug/run_scalefree_app1.sh epyc   the EPYC 7302P, timing and energy
 #
+# On a node shared with other users, name a free card first, because a sweep now
+# refuses to run on a card somebody else is computing on. The variable reaches
+# the sweeps through the environment and needs nothing added here:
+#
+#   nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv
+#   SWEEP_GPU=3 ./debug/run_scalefree_app1.sh a100
+#
 # Each stage is independent and a failure in one does not stop the rest, because
 # this is meant to be started and left. The summary at the end says which stages
 # produced a file and how many rows, so a partial session is obvious rather than

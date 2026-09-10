@@ -172,12 +172,24 @@ counts settle the question outright, because identical machine code cannot run
 at two speeds for a reason inside the code, and counts a few apart with neither
 arm spilling cannot produce a large factor either.
 
-It refuses to start while any compute process is on the node, because a timing
+It refuses to start on a card another job is computing on, because a timing
 measurement taken beside somebody else's job reports the sharing rather than
-the program, and it says so instead of measuring through. `ALLOW_BUSY=1`
-overrides that, which is worth doing only to demonstrate that a busy node is
-the cause of something. A job that arrives after the start is caught between
-arms and reported as a warning.
+the program, and it says so instead of measuring through. On a shared node,
+name a free card with `SWEEP_GPU`, the same variable the sweeps take:
+
+    nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv
+    SWEEP_GPU=3 ./debug/check_regex_exit.sh a100
+
+The card is pinned by its UUID rather than by an index, because CUDA and NVML
+number the devices differently and an index that names the free card to
+nvidia-smi can name a busy one to the program. Both applications bind their
+power sampler by PCI bus id taken from the CUDA device, so the energy path
+follows the same pinning. With `SWEEP_GPU` unset the program picks its own
+device and no index can be checked, so the whole node has to be free.
+
+`ALLOW_BUSY=1` overrides the refusal, which is worth doing only to demonstrate
+that a busy card is the cause of something. A job that arrives after the start
+is caught between arms and reported as a warning.
 
 The closing section states what each outcome means. It writes no csv and
 removes its two binaries at the end.

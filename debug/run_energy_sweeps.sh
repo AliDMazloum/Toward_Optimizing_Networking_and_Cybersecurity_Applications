@@ -21,6 +21,16 @@
 #   ./debug/run_energy_sweeps.sh h200
 #   ./debug/run_energy_sweeps.sh h200 --check-only    stop after characterising
 #
+# On a node shared with other users, name a free card first, because a sweep now
+# refuses to run on a card somebody else is computing on:
+#
+#   nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv
+#   SWEEP_GPU=3 ./debug/run_energy_sweeps.sh a100
+#
+# The variable reaches the sweeps through the environment and needs nothing
+# added here. Energy follows it too, because both programs bind their power
+# sampler by PCI bus id taken from the CUDA device rather than by an index.
+#
 # Sweeps append, and the workbook keeps the last five trials of each
 # configuration, so re-running after an interruption does not duplicate work.
 
