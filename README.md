@@ -9,20 +9,22 @@ The scripts implement GPU-accelerated versions of two dynamic-programming (DP) w
 1. **Smith–Waterman**, used for Deep Packet Inspection (DPI) signature matching.
 2. **Floyd–Warshall**, used for all-pairs shortest-path routing.
 
-Each DP algorithm is provided in multiple GPU-optimized variants to study the design trade-offs discussed in the paper (memory utilization vs. occupancy, regex support, and energy measurement).
+Each workload is one program that takes every design choice on the command line, so a point in the
+paper's sweeps is a set of flags rather than a rebuild.
 
 ---
 
 ## Repository contents
 
-| File | Algorithm | Focus |
-|------|-----------|-------|
-| [dpi_memory_focused.cu](App2/dpi_memory_focused.cu) | Smith–Waterman DPI | Memory-bandwidth optimized kernel (large payload / signature set, instrumented with NVML for power/energy logging). |
-| [dpi_memory_focused_energy.cu](App2/dpi_memory_focused_energy.cu) | Smith–Waterman DPI | Memory-focused kernel with a dedicated NVML power-polling thread used for the energy-consumption measurements reported in the paper. |
-| [dpi_occupancy_focused.cu](App2/dpi_occupancy_focused.cu) | Smith–Waterman DPI | Occupancy-optimized kernel (smaller block size, higher active warps per SM). |
-| [dpi_occupancy_focused_variant.cu](App2/dpi_occupancy_focused_variant.cu) | Smith–Waterman DPI | Alternate occupancy-focused configuration used for ablation runs. |
-| [dpi_regex_matching.cu](App2/dpi_regex_matching.cu) | Smith–Waterman DPI | DPI variant with regular-expression (character-class / metacharacter) support in the signature set. |
-| [floyd_warshall_routing.cu](App1/floyd_warshall_routing.cu) | Floyd–Warshall | GPU all-pairs shortest path for the routing case study. Carries both thread-to-data mappings and both DPX states, selected by command-line flags, with repeated trials and optional NVML energy sampling. |
+| File | Algorithm | What it is |
+|------|-----------|------------|
+| [floyd_warshall_routing.cu](App1/floyd_warshall_routing.cu) | Floyd–Warshall | GPU all-pairs shortest path for the routing case study. Three memory layouts, both DPX states, two store policies, two topologies, repeated trials, an optional host reference and optional NVML energy sampling, all selected by flag. |
+| [smith_waterman_dpi.cu](App2/smith_waterman_dpi.cu) | Smith–Waterman DPI | GPU signature matching for the deep packet inspection case study. Literal and regex scoring, both DPX states, DP rows in registers or in global memory, an optional host reference and optional NVML energy sampling, all selected by flag. |
+
+Several separate DPI programs, each carrying its problem size as compile-time constants, stood here
+until the revision. They are kept under `Old_files/App2/` for reference and are not built by the
+Makefile. The single program above computes what they computed; where it deliberately differs, and
+why, is documented in its source at the point of the difference.
 
 ---
 
@@ -35,8 +37,8 @@ Each DP algorithm is provided in multiple GPU-optimized variants to study the de
   routing program can also be built and run with `--dpx off`, which computes the same values with
   an ordinary add and minimum on the same GPU.
 - **CUDA Toolkit 12.0 or newer** (`nvcc`). The DPX math APIs used here are exposed by CUDA 12.
-- **NVML** (ships with the NVIDIA driver), required by the two memory-focused DPI
-  variants and by the routing program.
+- **NVML** (ships with the NVIDIA driver), linked by both programs and used only when `--energy`
+  is given.
 - **POSIX threads** (`pthread`), used by the NVML power-polling thread.
 - A Linux environment. The energy-measurement path uses `clock_gettime(CLOCK_MONOTONIC)`,
   `nanosleep` and pthreads, so it does not build unmodified on Windows; use WSL2 with the
@@ -60,8 +62,9 @@ the output file together. Nothing has to be remembered at the prompt:
 ```bash
 make h200         # build both applications for the H200
 make h200-app1    # the network resilience system only
-make h200-check   # run App1's eight kernel variants and check them
+make h200-check   # run all twenty kernel variants and check each one
 make h200-sweep   # run the App1 sweep reported in the paper
+make h200-sweep2  # run the App2 sweep reported in the paper
 make h200-clean   # remove this machine's binaries and nothing else
 ```
 
@@ -76,7 +79,9 @@ revision from adding rows that its header no longer describes.
 Before running anything, a sweep asks the node which GPU it has
 and refuses if the answer does not match the target's name, which catches a job that landed on the
 wrong machine before it produces a mislabelled number. `SWEEP_NODES`, `SWEEP_TRIALS`, `SWEEP_WARMUP`,
-`SWEEP_FLAGS` and `SWEEP_CSV` override what it runs and where it writes.
+`SWEEP_FLAGS` and `SWEEP_CSV` override what it runs and where it writes, and the `SWEEP2_`
+equivalents do the same for App2. A sweep also refuses to run on a GPU another process is computing
+on; see **Reproducing the paper results** for why and for how to name a free card.
 
 ### The general targets
 
@@ -86,8 +91,9 @@ The machine targets are shorthand for these, which take the architecture and the
 make ARCHES=90 TAG=h200            # build everything
 make ARCHES=90 TAG=h200 app1       # the network resilience system only
 make ARCHES=90 TAG=h200 app2       # the deep packet inspection system only
-make ARCHES=90 TAG=h200 check      # build App1 and run its eight kernel variants
+make ARCHES=90 TAG=h200 check      # run all twenty kernel variants and check each one
 make ARCHES=90 TAG=h200 sweep      # run the reported App1 sweep
+make ARCHES=90 TAG=h200 sweep2     # run the reported App2 sweep
 make ARCHES=90 TAG=h200 clean      # remove the binaries for this tag only
 make clean-all                     # remove every tag, including other machines'
 ```
@@ -104,15 +110,22 @@ self-contained and can be compiled directly:
 
 ```bash
 TAG=h200   # or a100, so the two machines do not overwrite each other
-nvcc -O3 -arch=sm_90 App2/dpi_occupancy_focused.cu         -o App2/dpi_occupancy_focused-$TAG
-nvcc -O3 -arch=sm_90 App2/dpi_occupancy_focused_variant.cu -o App2/dpi_occupancy_focused_variant-$TAG
-nvcc -O3 -arch=sm_90 App2/dpi_regex_matching.cu            -o App2/dpi_regex_matching-$TAG
-nvcc -O3 -arch=sm_90 App2/dpi_memory_focused.cu        -lnvidia-ml -lpthread -o App2/dpi_memory_focused-$TAG
-nvcc -O3 -arch=sm_90 App2/dpi_memory_focused_energy.cu -lnvidia-ml -lpthread -o App2/dpi_memory_focused_energy-$TAG
-nvcc -O3 -arch=sm_90 App1/floyd_warshall_routing.cu    -lnvidia-ml -lpthread -o App1/floyd_warshall_routing-$TAG
+nvcc -O3 -arch=sm_90 -Xcompiler -fopenmp,-march=native \
+     App1/floyd_warshall_routing.cu -lnvidia-ml -lpthread -o App1/floyd_warshall_routing-$TAG
+nvcc -O3 -arch=sm_90 -Xcompiler -fopenmp,-march=native \
+     App2/smith_waterman_dpi.cu     -lnvidia-ml -lpthread -o App2/smith_waterman_dpi-$TAG
 ```
 
-The results in the paper were produced on an **NVIDIA H100** (`-arch=sm_90`). Replace the flag with the architecture of your GPU if needed (e.g. `sm_70` for V100, `sm_80` for A100, `sm_86` for RTX 30xx, `sm_89` for RTX 40xx).
+`-Xcompiler -fopenmp,-march=native` applies to the host reference that `--cpu` runs, not to the
+kernels. It is what the reported CPU baselines were built with, so leave it in when comparing against
+them and drop it for a serial, portable host build. Because `-march=native` targets the machine doing
+the compiling, build on the node that runs, or the binary can trap on an instruction the run node
+lacks.
+
+The two GPUs behind the reported results are an **NVIDIA H200 NVL** and an **NVIDIA A100-SXM4-40GB**,
+built with `-arch=sm_90` and `-arch=sm_80` respectively; the machine targets above set that for you.
+For another GPU, replace the flag with its architecture, for example `sm_70` for a V100 or `sm_89` for
+an RTX 40xx. Only Hopper and later execute the DPX intrinsics in hardware.
 
 ### Toolchain used for the reported results
 
@@ -135,56 +148,41 @@ On systems where `libnvidia-ml.so` is not on the default library path, add `-L/u
 
 ## Running
 
-All binaries are self-contained: input payloads, signature databases, and graphs are generated
-inside `main()` from the compile-time constants at the top of each file, so no external dataset is
-needed. The DPI programs seed the generator with `srand(time(NULL))`, which means the signature
-set differs between runs; the signature at `MatchingIndex` is planted so that a match always
-exists. Floyd–Warshall builds a deterministic graph and takes no seed. To sweep a different
-problem size, edit the constants and recompile, except in the regex variant, which also accepts
-them as command-line options.
+Both programs are self-contained: payloads, signature sets and graphs are generated inside `main()`,
+so no external dataset is needed. Both take a `--seed`, and generation is a deterministic function of
+it, so a run is reproducible from the settings it prints. Every run begins by printing those settings
+as comment lines, which means the output documents the configuration that produced it.
 
-### DPI (Smith–Waterman) variants
-
-Relevant compile-time parameters (top of each DPI file):
-
-| Macro | Meaning |
-|-------|---------|
-| `PayloadSize` | Length of each packet payload (bytes). |
-| `NumberOfSignatures` | Total number of signatures in the database. |
-| `MaxSignatureLength` | Maximum signature length (bytes). |
-| `MatchingIndex` | Index of the signature that is forced to match (used to verify correctness). |
-| `midPoint` | Half of the signature set, and the number of threads launched. Each thread scores signature `t` in the low halfword and signature `t + midPoint` in the high halfword of one 32-bit word, which is what `__vimax3_s16x2_relu` operates on. |
-| `blockSize` / `gridSize` | CUDA launch configuration. |
-
-`dpi_memory_focused`, `dpi_memory_focused_energy`, `dpi_occupancy_focused` and
-`dpi_occupancy_focused_variant` take no command-line options:
+### DPI (Smith–Waterman)
 
 ```bash
-./App2/dpi_memory_focused-h200
-./App2/dpi_occupancy_focused-h200
-```
-
-`dpi_regex_matching` overrides its constants from the command line, and prints the configuration
-it used on the first line of output:
-
-```bash
-./App2/dpi_regex_matching-h200 --p_size 512 --s_count 10000 --s_len 16 --m_idx 1356 --block 32 1 1 --grid 313 1 1 --verbose
+./App2/smith_waterman_dpi-h200 --signatures 10000000 --payload 512 --sig-len 16 \
+    --mode literal --rows registers --dpx on --trials 5 --warmup 1 --csv Results/my_run.csv
 ```
 
 | Option | Meaning |
 |--------|---------|
-| `--p_size <int>` | Payload size in bytes. |
-| `--s_count <int>` | Number of signatures. |
-| `--s_len <int>` | Maximum signature length in bytes. |
-| `--m_idx <int>` | Index of the planted matching signature, which must be below `--s_count`. |
-| `--block <x> <y> <z>` | Block dimensions. |
-| `--grid <x> <y> <z>` | Grid dimensions. If the grid is left at one block, it is set to `ceil((s_count / 2) / blockSize)`. |
-| `--verbose` | Print processing time and other execution details. |
-| `--help` | Print the option list. |
+| `--signatures <int>` | Number of signatures, even. Default 20000000. |
+| `--payload <int>` | Payload length in bytes. Default 512. |
+| `--sig-len <int>` | Signature length, 16 or 32. Both are compile-time bounds on the register-resident rows. |
+| `--mode <name>` | `literal` or `regex`. Regex adds `*`, `.` and `~`, which score zero and so preserve the reading of the threshold as a fraction of literal agreement. |
+| `--rows <where>` | `registers` or `global`: where the two DP rows live. |
+| `--dpx <state>` | `on` uses `__vimax3_s16x2_relu`, packing two signatures into one 32-bit word; `off` computes the same values with ordinary integer operations on the same GPU. |
+| `--alpha <float>` | Detection threshold as a fraction of the maximum score. Default 0.8. |
+| `--block <int>` | Threads per block. Default 32. |
+| `--exit <policy>` | `first` stops a thread at its first report, `never` scans everything. |
+| `--plant <int>` | Force this signature to match the payload. Default none, so nothing matches, which is the worst case the throughput figures describe. |
+| `--alphabet <name>` | `lower26`, `ascii95` or `bytes256`: the bytes the generated data is drawn from. It sets how often unrelated strings agree by chance, so any false positive rate depends on it. Default `lower26`. |
+| `--trials`, `--warmup` | Measured and unmeasured repetitions. |
+| `--repeat <int>`, `--min-window <sec>` | Repeat the scan inside one timed window, so a run too short for the energy instruments can be lengthened. Every reported figure is still per scan. |
+| `--cpu` | Run the host reference instead of the GPU. |
+| `--energy`, `--poll-ms`, `--power-csv` | NVML power sampling and its interval and dump file. |
+| `--device <int>`, `--seed <int>`, `--csv <path>` | Device, generator seed, and the results file to append to. |
+| `--verify <what>` | `report`, `all` or `off`: recheck the reported crossing, or every signature, against the host reference. |
 
-Each program prints the measured kernel time, and the index and score of the signature the kernel
-reported as matching. The two memory-focused variants also print the sampled power and the energy
-integrated over the kernel window.
+The program prints one row per trial with the kernel and end to end time, and the index, score and
+position of any signature it reported. With verification on it also prints a mismatch count against
+the host reference, which must be zero.
 
 ### Floyd–Warshall
 
@@ -206,7 +204,7 @@ readable.
 | Option | Meaning |
 |--------|---------|
 | `--nodes <int>` | Number of vertices. Default 12000. |
-| `--layout <name>` | `coalesced`, in which a block strides over rows and a thread over columns, or `strided`, the non-coalesced mapping in which consecutive threads address entries `nodes` apart. Default `coalesced`. |
+| `--layout <name>` | `coalesced`, in which a block strides over rows and a thread over columns; `strided`, the non-coalesced mapping in which consecutive threads address entries `nodes` apart; or `tiled`, the blocked formulation. Default `coalesced`. |
 | `--dpx <state>` | `on` uses a DPX instruction; `off` computes the same value with an ordinary add and minimum, which is the DPX-off arm on the same GPU. Default `on`. |
 | `--store <policy>` | `always` writes every cell on every pass. `changed` writes only the cells whose value improves, which removes most of the write traffic and is what the originally published kernel did. With `--dpx on` the two policies use different instructions, `__viaddmin_s32` and `__vibmin_s32` respectively, because only the second returns the comparison alongside the minimum. Default `always`. |
 | `--trials <int>` | Measured repetitions. Default 1. |
@@ -217,6 +215,11 @@ readable.
 | `--device <int>` | CUDA and NVML device index. Default 0. |
 | `--csv <path>` | Append one row per trial, with every setting, to this file. A file whose header is not the one this build writes is refused, so rows never land under a header that does not describe them. |
 | `--power-csv <path>` | Write every power sample to this file. |
+| `--topology <name>` | `chain` or `scale-free`. Default `chain`. |
+| `--attach <int>` | Scale-free only: edges each new vertex adds. |
+| `--seed <int>` | Scale-free only: generator seed. Default 1. |
+| `--block <int>` | Threads per block for the flat layouts. |
+| `--sync <state>` | `per-launch` or `none`: whether the host synchronizes after each launch. |
 | `--no-verify` | Skip the correctness check. |
 
 The block size is fixed at 256 threads, which performed best in our measurements. The block count is
@@ -225,34 +228,55 @@ device can hold resident for the selected kernel, obtained from the occupancy AP
 Every run prints the derived value along with all other settings, so the output documents the
 configuration that produced it.
 
-The topology is a directed chain in which vertex `i` has one outgoing edge to vertex `i + 1` of
-weight 1, so the correct distance matrix is known in closed form. Unless `--no-verify` is given,
-every trial is checked entry by entry against `j - i` for `j >= i` and `INF` otherwise, and the
-number of mismatching entries is reported.
+Two topologies are available and they are checked differently, which is the point of having both.
+`chain` is a directed chain in which vertex `i` has one outgoing edge to vertex `i + 1` of weight 1,
+so the correct distance matrix is known in closed form, and unless `--no-verify` is given every trial
+is checked entry by entry against `j - i` for `j >= i` and `INF` otherwise. `scale-free` is a
+Barabasi-Albert graph grown by preferential attachment, which has no closed-form distance matrix, so
+verification there runs the host triple loop once per invocation and compares against that. The
+generated graph is the paper's primary evaluation because it is the realistic one; the chain carries
+the stronger correctness claim because its answer is known independently of any implementation.
 
 ---
 
 ## Reproducing the paper results
 
-Every file is committed with the configuration of one point in the paper's sweeps. The table below
-lists what is set in this release, so that a reported number can be traced to a build.
+Nothing needs recompiling to move between points. Every configuration in the paper is a set of flags,
+and the Makefile's sweep targets encode the reported protocol so a whole sweep is one command:
 
-| File | Problem size as committed | Launch configuration |
-|------|---------------------------|----------------------|
-| `dpi_memory_focused.cu` | `PayloadSize 512`, `MaxSignatureLength 16`, `NumberOfSignatures 20000000`, `midPoint 10000000`, `MatchingIndex 99501` | `blockSize 32`, `gridSize = ceil(midPoint / blockSize) = 312500`, launched with `gridSize + 1` blocks |
-| `dpi_memory_focused_energy.cu` | same as above | same as above, plus an NVML polling thread |
-| `dpi_occupancy_focused.cu` | `PayloadSize 512`, `MaxSignatureLength 16`, `NumberOfSignatures 10000000`, `midPoint 5000000`, `MatchingIndex 99152` | `blockSize 64`, `gridSize = 78125` |
-| `dpi_occupancy_focused_variant.cu` | same as above | same as above |
-| `dpi_regex_matching.cu` | `PayloadSize 50`, `MaxSignatureLength 20`, `NumberOfSignatures 10000`, `MatchingIndex 1356` | default block `(10, 1, 1)`, grid derived from the signature count; both overridable on the command line |
-| `floyd_warshall_routing.cu` | Set by `--nodes`, default 12000. `INF 99999` | 256 threads per block, block count derived per run, one kernel launch per intermediate vertex |
+```bash
+make h200-sweep     # the App1 sweep, every topology size, both DPX states
+make h200-sweep2    # the App2 sweep, both configurations, every signature count
+```
 
-Scoring parameters are `match = 2`, `mismatch = -1` and `indel = -1` in the four plain DPI variants,
-and `match = 6`, `mismatch = -3` and `indel = -2` in the regex variant.
+and the same two with `a100`. What those targets set:
 
-The paper's second DPI configuration, `(1024, 32)`, is obtained by setting `PayloadSize` to 1024 and
-`MaxSignatureLength` to 32. Each signature-count point in the sweeps is obtained by setting
-`NumberOfSignatures`, with `midPoint` at half that value, and recompiling. For Floyd–Warshall,
-nothing needs recompiling: each topology size, mapping and DPX state is a command-line flag.
+| | App1 | App2 |
+|---|---|---|
+| sizes | 1000, 2000, 3000, 6000, 12000, 24000 vertices | 10K to 50M signatures |
+| configurations | three layouts, two store policies, two topologies | (512, 16) and (1024, 32) |
+| DPX | on and off at every point | on and off at every point |
+| trials | 5 measured after 1 warm-up | 5 measured after 1 warm-up |
+
+Override any of them with `SWEEP_NODES`, `SWEEP_TRIALS`, `SWEEP_WARMUP`, `SWEEP_FLAGS`, `SWEEP_CSV`
+and the `SWEEP2_` equivalents.
+
+**A sweep refuses to run on a GPU another process is computing on.** A timing measurement taken
+beside another job reports the sharing rather than the program, and the results file it writes cannot
+afterwards be told from a good one, so the check happens before anything is written. On a shared node,
+find a free card and name it:
+
+```bash
+nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv
+make a100-sweep2 SWEEP_GPU=3
+```
+
+The card is then pinned by its UUID rather than by an index, because CUDA and NVML number devices
+differently and an index that names the free card to one can name a busy card to the other.
+`ALLOW_BUSY=1` overrides the refusal, for a deliberate measurement of a shared card.
+
+Scoring parameters are `match = 1`, `mismatch = -2` in literal mode and `match = 6`, `mismatch = -3`,
+`indel = -2` in regex mode, where the three metacharacters contribute zero.
 
 ### How time and energy are measured
 
@@ -268,20 +292,34 @@ nothing needs recompiling: each topology size, mapping and DPX state is a comman
   keeps its samples in memory, so no file writing happens inside a measured window. Energy for a
   trial is the trapezoidal integral of the samples whose timestamps fall inside that trial's end to
   end window; a window holding fewer than two samples is reported as missing rather than estimated.
-  Use `dpi_memory_focused_energy.cu` for the DPI energy figures and `--energy` for the routing ones.
+  Both programs take `--energy`, and both resolve the NVML handle by the PCI bus id of the CUDA
+  device they ran on rather than by device index, because CUDA and NVML order devices differently and
+  an index can therefore name a card that ran nothing.
+- **A run shorter than the driver's power refresh interval cannot be measured this way**, whatever the
+  sampler does, because the value it reads was computed before the run began. That interval is a
+  property of the card and driver rather than a constant, so measure it rather than assuming it. Where
+  a scan is too short, `--repeat` or `--min-window` repeats it inside one timed window and every
+  reported figure is divided back down to one scan.
+- **CPU energy** comes from the powercap RAPL counters, read at the window edges rather than sampled,
+  so it carries no such lower limit. The counter wraps, and the reader unwraps it per package.
 
 ---
 
 ## Citation
 
-The revision submitted to IEEE Access cites this repository at tag **`v1.0`**. Use that tag, rather
-than the tip of `main`, to obtain the sources exactly as they were evaluated in the paper:
+The revision submitted to IEEE Access cites this repository at tag **`v2.0`**. Use that tag, rather
+than the tip of `main`, to obtain the sources exactly as they were evaluated in the revision:
 
 ```bash
 git clone https://github.com/AliDMazloum/Toward_Optimizing_Networking_and_Cybersecurity_Applications.git
 cd Toward_Optimizing_Networking_and_Cybersecurity_Applications
-git checkout v1.0
+git checkout v2.0
 ```
+
+`v1.0` is the earlier tag and it does **not** reproduce the revision. It predates the rewrite of the
+DPI system into one program, the tiled layout and the generated topology in the routing system, the
+resolution of the NVML handle by PCI bus id, the unwrapping of the RAPL counter, and the correctness
+fixes made during the revision. It is kept because it is what the original submission cited.
 
 A full citation entry will be added here once the paper is accepted for publication.
 
