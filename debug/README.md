@@ -166,8 +166,18 @@ happened to be running and would read exactly like a property of the code. What
 else holds memory on the card is recorded before and after as well, since a
 neighbour present for the whole run is invisible to the interleaving.
 
-It also prints the register count of the regex kernel each arm launches. Equal
-counts settle the question without reference to any timing, because identical
-machine code cannot run at two speeds for a reason inside the code. The closing
-section states what each outcome means. It writes no csv and removes its two
-binaries at the end.
+It also prints the register count of the regex kernel each arm launches, which
+bounds what the code can be responsible for whatever the timings do. Equal
+counts settle the question outright, because identical machine code cannot run
+at two speeds for a reason inside the code, and counts a few apart with neither
+arm spilling cannot produce a large factor either.
+
+It refuses to start while any compute process is on the node, because a timing
+measurement taken beside somebody else's job reports the sharing rather than
+the program, and it says so instead of measuring through. `ALLOW_BUSY=1`
+overrides that, which is worth doing only to demonstrate that a busy node is
+the cause of something. A job that arrives after the start is caught between
+arms and reported as a warning.
+
+The closing section states what each outcome means. It writes no csv and
+removes its two binaries at the end.

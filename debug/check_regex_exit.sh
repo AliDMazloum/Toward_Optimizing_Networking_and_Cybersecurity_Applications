@@ -104,6 +104,30 @@ neighbours() {   # neighbours <when>
 neighbours "before"
 echo
 
+# A foreign job anywhere on the node stops the run, rather than being noted and
+# then measured through. Which physical card a foreign process sits on cannot be
+# matched against the card this program picks without care, because CUDA and
+# NVML order the devices differently, so the requirement here is the stricter
+# and simpler one: no compute process on the node but this one. That is what a
+# timing measurement needs in any case. Set ALLOW_BUSY=1 to measure anyway,
+# which is worth doing only to show that a busy node is the cause of something.
+foreign=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)
+if [ "$foreign" -gt 0 ]; then
+    if [ "${ALLOW_BUSY:-0}" = "1" ]; then
+        echo "  $foreign compute process(es) already on this node. ALLOW_BUSY=1"
+        echo "  is set, so the run continues, and every number below is a"
+        echo "  measurement of a shared card rather than of this program."
+        echo
+    else
+        echo "Refusing to run: $foreign compute process(es) are already using" >&2
+        echo "this node's GPUs, and a timing measurement taken beside them" >&2
+        echo "reports the sharing, not the program. Wait for the node, or set" >&2
+        echo "ALLOW_BUSY=1 to measure anyway and say so wherever the number" >&2
+        echo "is used." >&2
+        exit 1
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 echo "=============================================================="
 echo "Build"
@@ -167,11 +191,29 @@ regs_from "$SCRATCH/build.pin" "compile time"
 echo
 
 # ---------------------------------------------------------------------------
+# The per-trial rows the program writes to stdout begin with the trial number
+# and carry the kernel time second. The column header it writes first is not a
+# comment line, so rows are selected by shape rather than by not starting with
+# a hash: a leading integer, then a number. Letting the header through puts a
+# word into the sample, where awk scores it as zero and sorts it past every
+# real reading.
 run_arm() {   # run_arm <binary> <output file>
     ./"$1" --signatures "$SIGS" --payload "$PAY" --sig-len "$LEN" \
         --mode regex --rows registers --dpx on --block 32 --exit first \
         --trials "$TRIALS" --warmup "$WARMUP" 2>>"$SCRATCH/err" \
-        | grep -v '^#' | cut -d, -f2 >> "$2"
+        | awk -F, '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]*\.?[0-9]+$/ { print $2 }' \
+        >> "$2"
+}
+
+# The node was free when the run started, because the guard above insisted on
+# it. It can stop being free at any point after that, so the count is taken
+# again between arms and the largest is reported.
+busy_peak=0
+note_busy() {
+    local n
+    n=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)
+    [ "$n" -gt "$busy_peak" ] && busy_peak=$n
+    return 0
 }
 
 echo "=============================================================="
@@ -183,11 +225,21 @@ echo "=============================================================="
 for r in $(seq 1 "$REPS"); do
     printf '  rep %d of %d ' "$r" "$REPS"
     run_arm "$RT"  "$SCRATCH/rt"
+    note_busy
     printf 'run-time done, '
     run_arm "$PIN" "$SCRATCH/pin"
+    note_busy
     printf 'compile-time done\n'
 done
 echo
+# The count is taken between arms, when this check holds nothing on the card,
+# so anything at all is somebody else's.
+if [ "$busy_peak" -gt 0 ]; then
+    echo "  WARNING: up to $busy_peak foreign compute process(es) appeared on"
+    echo "  this node during the run, after the guard let it start, so the"
+    echo "  readings below are of a shared card."
+    echo
+fi
 
 # median, mean, smallest, largest, spread, count. The median leads for the
 # reason the overhead control gives: a cold clock boosts for whole trials, so a
@@ -262,6 +314,11 @@ things:
       That file records a busy machine rather than this program, and it has to
       be measured again before any ratio is taken from it.
 
-Equal register counts for the same kernel in both arms settle it on their own:
-identical machine code cannot run at two speeds for a reason inside the code.
+The register counts bound what the code can be responsible for, whatever the
+timings do. Equal counts settle it outright, since identical machine code
+cannot run at two speeds for a reason inside the code. Counts that differ by a
+few out of a hundred and fifty, with neither arm spilling to local memory,
+change occupancy by at most one warp per scheduler and cannot produce a large
+factor either. A large factor needs a large register move or a spill, and both
+are printed above.
 EOF
