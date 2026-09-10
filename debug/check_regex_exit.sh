@@ -24,11 +24,13 @@
 # named here. This is the same mechanism the sweep-time behaviour uses, so the
 # arms bracket the change that is in question.
 #
-# The arms are interleaved rather than run one after the other. A neighbouring
-# job that comes and goes would otherwise land entirely on whichever arm
-# happened to be running, and would read exactly like a property of the code.
-# Interleaved, a busy machine slows both arms together and the ratio survives;
-# a real code difference moves the ratio and holds it steady across reps.
+# The arms are interleaved rather than run one after the other, and their order
+# alternates. A neighbouring job that comes and goes would otherwise land
+# entirely on whichever arm happened to be running, and would read exactly like
+# a property of the code; a load that drifts one way over the session would do
+# the same to whichever arm always went first. Interleaved and alternated, a
+# busy machine slows both arms together and the ratio survives, while a real
+# code difference moves the ratio and holds it steady across reps.
 #
 # What else is on the card is also recorded, before and after, because a
 # neighbour that was there for the whole run is invisible to the interleaving.
@@ -45,7 +47,7 @@
 set -u
 
 MACHINE=${1:-}
-REPS=${REPS:-3}
+REPS=${REPS:-4}   # even, so each arm goes first equally often
 SIGS=${SIGS:-10000000}
 PAY=${PAY:-1024}
 LEN=${LEN:-32}
@@ -223,13 +225,18 @@ echo "=============================================================="
 : > "$SCRATCH/pin"
 : > "$SCRATCH/err"
 for r in $(seq 1 "$REPS"); do
+    # The order alternates. Interleaving alone is not enough when the load on
+    # the node drifts one way over the session, because whichever arm always
+    # goes first then always meets the lighter machine, and that bias reads as
+    # a property of the code exactly like the effect being looked for.
     printf '  rep %d of %d ' "$r" "$REPS"
-    run_arm "$RT"  "$SCRATCH/rt"
-    note_busy
-    printf 'run-time done, '
-    run_arm "$PIN" "$SCRATCH/pin"
-    note_busy
-    printf 'compile-time done\n'
+    if [ $((r % 2)) -eq 1 ]; then
+        run_arm "$RT"  "$SCRATCH/rt";  note_busy; printf 'run-time done, '
+        run_arm "$PIN" "$SCRATCH/pin"; note_busy; printf 'compile-time done\n'
+    else
+        run_arm "$PIN" "$SCRATCH/pin"; note_busy; printf 'compile-time done, '
+        run_arm "$RT"  "$SCRATCH/rt";  note_busy; printf 'run-time done\n'
+    fi
 done
 echo
 # The count is taken between arms, when this check holds nothing on the card,
