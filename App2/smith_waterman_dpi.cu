@@ -11,10 +11,10 @@
 //                                (the memory-focused kernel) or in a coalesced
 //                                global-memory buffer (the occupancy-focused
 //                                kernel)
-//   --dpx  on | off              the DPX halfword instructions
+//   --dpx  on | off              the DPX halfword add-max instructions
 //                                __viaddmax_s16x2 and __viaddmax_s16x2_relu,
-//                                or the same per-halfword computation
-//                                without them
+//                                or the same per-halfword computation with
+//                                ordinary integer operations
 //
 // Two signatures are packed per 32-bit word (one per 16-bit halfword), so one
 // thread scores two signatures at once; the packing is identical in both
@@ -344,10 +344,13 @@ __host__ __device__ __forceinline__ uint32_t pack2(int lo, int hi)
     return (uint32_t)(uint16_t)(int16_t)lo | ((uint32_t)(uint16_t)(int16_t)hi << 16);
 }
 
-// The packed cell, both halfwords at once. The DPX arm is two instructions on
-// compute capability 9.0: __viaddmax_s16x2 gives max(n + gap, w + gap) per
-// halfword and __viaddmax_s16x2_relu gives max(nw + score, that, 0). The
-// plain arm is what --dpx off measures on the same chip.
+// The packed cell, both halfwords at once. The DPX arm calls three halfword
+// intrinsics, two of them the DPX add-max instructions: __vadd2 gives
+// w + gap, __viaddmax_s16x2 gives max(n + gap, that), and
+// __viaddmax_s16x2_relu gives max(nw + score, that, 0). How many machine
+// instructions those become is a property of the compiler and the
+// architecture and is not asserted here. The plain arm is what --dpx off
+// measures on the same chip.
 template <bool USE_DPX>
 __device__ __forceinline__ uint32_t cell_packed(uint32_t n, uint32_t nw, uint32_t w,
                                                 uint32_t score2, uint32_t gap2)
