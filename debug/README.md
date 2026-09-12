@@ -118,6 +118,11 @@ the size difference.
     ./debug/run_overhead_control.sh a100
     ./debug/run_overhead_control.sh h200
 
+Since the current program moved the character score inside the maximum, onto
+the diagonal only, the two arms compute different recurrences, so this control
+now measures the cost of the program's structure and its extra arithmetic
+together and no longer isolates the first.
+
 This matters because every ratio taken between two cards assumes the same
 program was measured on both. If the current program costs a few percent on one
 card and a great deal on the other, that difference lands in the ratio and reads

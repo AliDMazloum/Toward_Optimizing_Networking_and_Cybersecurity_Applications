@@ -31,11 +31,11 @@ why, is documented in its source at the point of the difference.
 ## Requirements
 
 - **NVIDIA GPU with compute capability 9.0** (Hopper, for example the H100 or H200) to execute the
-  DPX instructions in hardware. The kernels call two DPX intrinsics: `__vimax3_s16x2_relu` in the
-  DPI kernels and `__viaddmin_s32` in the Floyd–Warshall kernel. DPX was introduced with the NVIDIA
-  Hopper architecture, so a pre-Hopper GPU does not run these operations on DPX hardware. The
-  routing program can also be built and run with `--dpx off`, which computes the same values with
-  an ordinary add and minimum on the same GPU.
+  DPX instructions in hardware. The kernels call three DPX intrinsics: `__viaddmax_s16x2` and
+  `__viaddmax_s16x2_relu` in the DPI kernels and `__viaddmin_s32` in the Floyd–Warshall kernel.
+  DPX was introduced with the NVIDIA Hopper architecture, so a pre-Hopper GPU does not run these
+  operations on DPX hardware. Both programs can also be built and run with `--dpx off`, which
+  computes the same values with ordinary integer operations on the same GPU.
 - **CUDA Toolkit 12.0 or newer** (`nvcc`). The DPX math APIs used here are exposed by CUDA 12.
 - **NVML** (ships with the NVIDIA driver), linked by both programs and used only when `--energy`
   is given.
@@ -167,7 +167,7 @@ as comment lines, which means the output documents the configuration that produc
 | `--sig-len <int>` | Signature length, 16 or 32. Both are compile-time bounds on the register-resident rows. |
 | `--mode <name>` | `literal` or `regex`. Regex adds `*`, `.` and `~`, which score zero and so preserve the reading of the threshold as a fraction of literal agreement. |
 | `--rows <where>` | `registers` or `global`: where the two DP rows live. |
-| `--dpx <state>` | `on` uses `__vimax3_s16x2_relu`, packing two signatures into one 32-bit word; `off` computes the same values with ordinary integer operations on the same GPU. |
+| `--dpx <state>` | `on` uses the DPX halfword instructions `__viaddmax_s16x2` and `__viaddmax_s16x2_relu`, packing two signatures into one 32-bit word; `off` computes the same values with ordinary integer operations on the same GPU. |
 | `--alpha <float>` | Detection threshold as a fraction of the maximum score. Default 0.8. |
 | `--block <int>` | Threads per block. Default 32. |
 | `--exit <policy>` | `first` stops a thread at its first report, `never` scans everything. |
@@ -275,8 +275,11 @@ The card is then pinned by its UUID rather than by an index, because CUDA and NV
 differently and an index that names the free card to one can name a busy card to the other.
 `ALLOW_BUSY=1` overrides the refusal, for a deliberate measurement of a shared card.
 
-Scoring parameters are `match = 1`, `mismatch = -2` in literal mode and `match = 6`, `mismatch = -3`,
-`indel = -2` in regex mode, where the three metacharacters contribute zero.
+Scoring is the Smith–Waterman recurrence: the match or mismatch score enters on the diagonal only,
+and the gap penalty on the vertical and horizontal moves, so a signature position is credited at most
+once per alignment. Parameters are `match = 1`, `mismatch = -2`, `gap = -1` in literal mode and
+`match = 6`, `mismatch = -3`, `gap = -2` in regex mode, where the three metacharacters score zero and
+`*` also sets its gap to zero.
 
 ### How time and energy are measured
 

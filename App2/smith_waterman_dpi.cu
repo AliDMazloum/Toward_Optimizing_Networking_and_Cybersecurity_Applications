@@ -11,8 +11,10 @@
 //                                (the memory-focused kernel) or in a coalesced
 //                                global-memory buffer (the occupancy-focused
 //                                kernel)
-//   --dpx  on | off              the __vimax3_s16x2_relu instruction, or the
-//                                same per-halfword computation without it
+//   --dpx  on | off              the DPX halfword instructions
+//                                __viaddmax_s16x2 and __viaddmax_s16x2_relu,
+//                                or the same per-halfword computation
+//                                without them
 //
 // Two signatures are packed per 32-bit word (one per 16-bit halfword), so one
 // thread scores two signatures at once; the packing is identical in both
@@ -66,19 +68,20 @@
 // ---------------------------------------------------------------------------
 // Fixed parameters
 //
-// Literal mode adds 1 per matching character, so a signature's maximum score
-// is its length and the threshold is a fraction of that length. Regex mode
-// uses the larger match reward so that wildcard positions, which contribute
-// 0, still leave literal matches room to dominate. The >1, >3 and >4 guards
-// keep penalties from acting before an alignment has started.
+// Literal mode adds 1 per matching character, on the diagonal only, so a
+// signature's maximum score is its length and the threshold is a fraction of
+// that length. Regex mode uses the larger match reward so that wildcard
+// positions, which contribute 0, still leave literal matches room to
+// dominate; its maximum is RE_MATCH times the literal count.
 // ---------------------------------------------------------------------------
 
-#define LIT_MATCH     1   // literal mode: score added per matching character
-#define LIT_MISMATCH -2   // literal mode: penalty per mismatch, once started
+#define LIT_MATCH     1   // literal mode: diagonal score for a matching character
+#define LIT_MISMATCH -2   // literal mode: diagonal score for a mismatch
+#define LIT_GAP      -1   // literal mode: penalty for a vertical or horizontal move
 
-#define RE_MATCH      6   // regex mode: score per matching literal character
-#define RE_MISMATCH  -3   // regex mode: mismatch penalty, once started
-#define RE_INDEL     -2   // regex mode: gap penalty, suppressed by *
+#define RE_MATCH      6   // regex mode: diagonal score for a matching literal
+#define RE_MISMATCH  -3   // regex mode: diagonal score for a mismatched literal
+#define RE_INDEL     -2   // regex mode: gap penalty, 0 in a * column
 
 // Signature lengths the register-row kernel is compiled for. The DP rows and
 // the cached signature bytes can only stay in registers when the inner loop
@@ -275,23 +278,31 @@ static void power_dump_csv(const char *path)
 // The recurrence
 //
 // For payload p (length P) and signature s (length L), with H[0][*] and
-// H[*][0] fixed at 0:
+// H[*][0] fixed at 0, the Smith-Waterman cell:
 //
-//   base    = max(H[i-1][j], H[i-1][j-1], H[i][j-1], 0)
-//   H[i][j] = base + score(base, p[i-1], s[j-1])
+//   H[i][j] = max(H[i-1][j-1] + score(p[i-1], s[j-1]),
+//                 H[i-1][j]   + gap(s[j-1]),
+//                 H[i][j-1]   + gap(s[j-1]),
+//                 0)
 //
-// Three details of the recurrence:
+// The character score enters on the diagonal only, so a signature position is
+// credited at most once per alignment and a score never exceeds the match
+// reward times the literal count. Literal mode scores LIT_MATCH or
+// LIT_MISMATCH and charges LIT_GAP. Regex mode, by signature character:
 //
-//   - scanning starts at the first payload character, so every payload byte
-//     enters the recurrence,
-//   - literal mode tests the BASE value (the max of the three neighbours)
-//     against its threshold with strict greater-than,
-//   - regex mode tests the newly computed cell with greater-or-equal against
-//     a per-signature threshold.
+//   literal   RE_MATCH or RE_MISMATCH, gap RE_INDEL
+//   *         score 0 and gap 0, so it absorbs any run of payload bytes,
+//             including none
+//   .         score 0 against any byte, gap RE_INDEL
+//   ~         score 0 against a digit and RE_MISMATCH otherwise, gap RE_INDEL
 //
-// The score step is shared, host and device, so the host reference and the
-// kernels cannot drift apart, and the only thing --dpx changes is whether
-// the base is computed by the DPX instruction or by the plain equivalent.
+// Every payload byte enters the recurrence, and both modes test the newly
+// computed cell: literal with strict greater-than against floor(alpha * L),
+// regex with greater-or-equal against a per-signature threshold.
+//
+// The score functions are shared, host and device, so the host reference and
+// the kernels cannot drift apart, and the only thing --dpx changes is whether
+// the cell is computed by the DPX instructions or by the plain equivalent.
 // ---------------------------------------------------------------------------
 
 __host__ __device__ __forceinline__ bool is_ascii_digit(char c)
@@ -299,53 +310,63 @@ __host__ __device__ __forceinline__ bool is_ascii_digit(char c)
     return c >= '0' && c <= '9';
 }
 
-__host__ __device__ __forceinline__ int step_literal(int base, char p, char s)
+__host__ __device__ __forceinline__ int score_literal(char p, char s)
 {
-    if (p == s) return base + LIT_MATCH;
-    return base > 1 ? base + LIT_MISMATCH : base;
+    return p == s ? LIT_MATCH : LIT_MISMATCH;
 }
 
-// Regex scoring: '*' contributes 0 and suppresses the gap penalty, '.' matches
-// any one character contributing 0 (the gap penalty still applies), and '~'
-// matches any one digit contributing 0.
-__host__ __device__ __forceinline__ int step_regex(int base, char p, char s,
-                                                   bool p_is_digit)
+__host__ __device__ __forceinline__ int score_regex(char p, char s, bool p_is_digit)
 {
-    const bool star  = (s == '*');
-    const bool any1  = (s == '.');
-    const bool digit = (s == '~');
-
-    int t = base;
-    if (base > 3 && p != s && !star) t += RE_INDEL;
-    if (!star && !any1 && !digit) {
-        if (p == s)        t += RE_MATCH;
-        else if (base > 4) t += RE_MISMATCH;
-    }
-    if (digit && base > 4 && !p_is_digit) t += RE_MISMATCH;
-    return t;
+    if (s == '*' || s == '.') return 0;
+    if (s == '~') return p_is_digit ? 0 : RE_MISMATCH;
+    return p == s ? RE_MATCH : RE_MISMATCH;
 }
 
-__host__ __device__ __forceinline__ int max3_relu(int a, int b, int c)
+__host__ __device__ __forceinline__ int gap_regex(char s)
 {
-    int m = a > b ? a : b;
-    if (c > m) m = c;
+    return s == '*' ? 0 : RE_INDEL;
+}
+
+// One cell from its three neighbours, the diagonal score and the gap.
+__host__ __device__ __forceinline__ int cell_plain(int n, int nw, int w,
+                                                   int score, int gap)
+{
+    int m = nw + score;
+    if (n + gap > m) m = n + gap;
+    if (w + gap > m) m = w + gap;
     return m > 0 ? m : 0;
 }
 
-// The packed base: max of three values and 0, per signed 16-bit halfword. The
-// DPX arm is one instruction on compute capability 9.0; the plain arm is what
-// --dpx off measures on the same chip.
-template <bool USE_DPX>
-__device__ __forceinline__ uint32_t base_packed(uint32_t n, uint32_t nw, uint32_t w)
+// Two signed 16-bit values in one word: signature gid in the low halfword,
+// signature gid + midpoint in the high one.
+__host__ __device__ __forceinline__ uint32_t pack2(int lo, int hi)
 {
-    if (USE_DPX) return __vimax3_s16x2_relu(n, nw, w);
-    const int lo = max3_relu((int)(int16_t)(n  & 0xFFFFu),
-                             (int)(int16_t)(nw & 0xFFFFu),
-                             (int)(int16_t)(w  & 0xFFFFu));
-    const int hi = max3_relu((int)(int16_t)(n  >> 16),
-                             (int)(int16_t)(nw >> 16),
-                             (int)(int16_t)(w  >> 16));
-    return (uint32_t)(uint16_t)lo | ((uint32_t)(uint16_t)hi << 16);
+    return (uint32_t)(uint16_t)(int16_t)lo | ((uint32_t)(uint16_t)(int16_t)hi << 16);
+}
+
+// The packed cell, both halfwords at once. The DPX arm is two instructions on
+// compute capability 9.0: __viaddmax_s16x2 gives max(n + gap, w + gap) per
+// halfword and __viaddmax_s16x2_relu gives max(nw + score, that, 0). The
+// plain arm is what --dpx off measures on the same chip.
+template <bool USE_DPX>
+__device__ __forceinline__ uint32_t cell_packed(uint32_t n, uint32_t nw, uint32_t w,
+                                                uint32_t score2, uint32_t gap2)
+{
+    if (USE_DPX) {
+        const uint32_t from_gap = __viaddmax_s16x2(n, gap2, __vadd2(w, gap2));
+        return __viaddmax_s16x2_relu(nw, score2, from_gap);
+    }
+    const int lo = cell_plain((int)(int16_t)(n  & 0xFFFFu),
+                              (int)(int16_t)(nw & 0xFFFFu),
+                              (int)(int16_t)(w  & 0xFFFFu),
+                              (int)(int16_t)(score2 & 0xFFFFu),
+                              (int)(int16_t)(gap2 & 0xFFFFu));
+    const int hi = cell_plain((int)(int16_t)(n  >> 16),
+                              (int)(int16_t)(nw >> 16),
+                              (int)(int16_t)(w  >> 16),
+                              (int)(int16_t)(score2 >> 16),
+                              (int)(int16_t)(gap2 >> 16));
+    return pack2(lo, hi);
 }
 
 // ---------------------------------------------------------------------------
@@ -491,28 +512,26 @@ __global__ void sw_scan(int midpoint, int payload_len,
                 w  = rows[cur  + (long long)(j - 1) * midpoint + gid];
             }
 
-            const uint32_t base2 = base_packed<USE_DPX>(n, nw, w);
-            const int b0 = (int)(int16_t)(base2 & 0xFFFFu);
-            const int b1 = (int)(int16_t)(base2 >> 16);
-
             const char s0 = ROWS_REG ? sig0[j - 1] : signatures[off0 + j - 1];
             const char s1 = ROWS_REG ? sig1[j - 1] : signatures[off1 + j - 1];
 
-            const int t0 = REGEX ? step_regex(b0, p, s0, pdig)
-                                 : step_literal(b0, p, s0);
-            const int t1 = REGEX ? step_regex(b1, p, s1, pdig)
-                                 : step_literal(b1, p, s1);
+            const uint32_t score2 = REGEX
+                ? pack2(score_regex(p, s0, pdig), score_regex(p, s1, pdig))
+                : pack2(score_literal(p, s0), score_literal(p, s1));
+            const uint32_t gap2 = REGEX ? pack2(gap_regex(s0), gap_regex(s1))
+                                        : pack2(LIT_GAP, LIT_GAP);
 
-            const uint32_t packed =
-                (uint32_t)(uint16_t)t0 | ((uint32_t)(uint16_t)t1 << 16);
+            const uint32_t packed = cell_packed<USE_DPX>(n, nw, w, score2, gap2);
+            const int t0 = (int)(int16_t)(packed & 0xFFFFu);
+            const int t1 = (int)(int16_t)(packed >> 16);
             if (ROWS_REG) {
                 if (even) rowB[j] = packed; else rowA[j] = packed;
             } else {
                 rows[cur + (long long)j * midpoint + gid] = packed;
             }
 
-            // Detection, per mode: regex tests the new cell with >=, literal
-            // tests the base with strict > and reports the base.
+            // Detection, per mode, on the new cell: regex with >=, literal
+            // with strict >.
             if (REGEX) {
                 if (t0 >= thr0) {
                     claim_report(report, t0, gid, i - 1);
@@ -522,11 +541,11 @@ __global__ void sw_scan(int midpoint, int payload_len,
                     if (exit_now) return;
                 }
             } else {
-                if (b0 > thr0) {
-                    claim_report(report, b0, gid, i - 1);
+                if (t0 > thr0) {
+                    claim_report(report, t0, gid, i - 1);
                     if (exit_now) return;
-                } else if (b1 > thr1) {
-                    claim_report(report, b1, gid + midpoint, i - 1);
+                } else if (t1 > thr1) {
+                    claim_report(report, t1, gid + midpoint, i - 1);
                     if (exit_now) return;
                 }
             }
@@ -538,9 +557,9 @@ __global__ void sw_scan(int midpoint, int payload_len,
 // Host reference
 //
 // The same recurrence on the host, one signature at a time, through the same
-// score-step functions the kernel uses, with the same detection semantics:
-// every payload byte scored, literal tested on the base with strict >, regex
-// tested on the new cell with >=. Returns true at the first threshold
+// score functions the kernel uses, with the same detection semantics: every
+// payload byte scored and the new cell tested, literal with strict > and
+// regex with >=. Returns true at the first threshold
 // crossing with its score and position, which for a given signature is
 // deterministic, so a reported detection must reproduce exactly. When nothing
 // crosses, best_out holds the maximum cell value seen.
@@ -562,13 +581,15 @@ static bool host_scan_signature(bool regex_mode, const char *payload, int P,
         const bool pdig = is_ascii_digit(p);
         cur[0] = 0;
         for (int j = 1; j <= L; j++) {
-            const int base = max3_relu(prev[j], prev[j - 1], cur[j - 1]);
-            const int t = regex_mode ? step_regex(base, p, sig[j - 1], pdig)
-                                     : step_literal(base, p, sig[j - 1]);
+            const char s = sig[j - 1];
+            const int score = regex_mode ? score_regex(p, s, pdig)
+                                         : score_literal(p, s);
+            const int gap   = regex_mode ? gap_regex(s) : LIT_GAP;
+            const int t = cell_plain(prev[j], prev[j - 1], cur[j - 1], score, gap);
             cur[j] = t;
             if (t > best) best = t;
-            if (regex_mode ? (t >= thr) : (base > thr)) {
-                *score_out = regex_mode ? t : base;
+            if (regex_mode ? (t >= thr) : (t > thr)) {
+                *score_out = t;
                 *pos_out   = i - 1;
                 *best_out  = best;
                 return true;
@@ -782,8 +803,8 @@ static int literal_count(const char *sig, int L)
     return n;
 }
 
-// Literal mode: the kernel tests the base against alpha * L; for integer
-// bases that is strict > against floor(alpha * L), which is what is passed
+// Literal mode: the kernel tests the cell against alpha * L; for integer
+// scores that is strict > against floor(alpha * L), which is what is passed
 // to the kernel.
 static int literal_threshold(int L, double alpha)
 {
@@ -940,7 +961,7 @@ static void print_usage(const char *prog)
     printf("  --dpx <state>       on | off (default on)\n");
     printf("  --alpha <float>     detection threshold fraction, in (0, 1]\n");
     printf("                      (default 0.8): literal detects when a\n");
-    printf("                      base score exceeds alpha * length; a regex\n");
+    printf("                      cell score exceeds alpha * length; a regex\n");
     printf("                      signature with wildcards needs its full\n");
     printf("                      literal score\n");
     printf("  --block <int>       threads per block (default 32)\n");
@@ -1335,7 +1356,7 @@ int main(int argc, char **argv)
             printf("# threshold         : %d (random signatures)\n",
                    thresholds[rnd]);
     } else {
-        printf("# threshold         : base score > %d, of a maximum %d\n",
+        printf("# threshold         : score > %d, of a maximum %d\n",
                threshold_lit, L);
     }
     printf("# cell_updates      : %.0f per trial (every payload byte, 0..%d)\n",
