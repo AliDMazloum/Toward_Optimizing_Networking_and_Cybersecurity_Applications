@@ -286,11 +286,6 @@ detected rather than how long it takes.
 | DPI on the CPU, EPYC 9355, 32 threads | `app2_cpu_h200.csv` | the DPI program run directly, with no driver script: `--cpu --mode literal --alpha 0.8 --signatures <N> --payload <P> --sig-len <L> --trials 5 --warmup 1` under `OMP_NUM_THREADS=32`, over the same signature counts and configurations, as the rows of the file record |
 | DPI on the CPU, EPYC 7302P, 16 threads, time and RAPL energy | `app2_cpu_epyc.csv` | the same with `--energy` and `OMP_NUM_THREADS=16` |
 
-The two DPI CPU files were measured on 2026-09-08, before commit `a7dc195` moved the score term
-onto the diagonal transition; they were retained. That change alters which neighbour supplies the
-score term in each cell, not the number of cells computed, so the cell updates per scan are unchanged. Every
-GPU file above was measured after it.
-
 **A sweep refuses to run on a GPU another process is computing on.** A timing measurement taken
 beside another job reports the sharing rather than the program, and the results file it writes cannot
 afterwards be told from a good one, so the check happens before anything is written. On a shared node,
