@@ -63,7 +63,7 @@ the output file together. Nothing has to be remembered at the prompt:
 make h200         # build both applications for the H200
 make h200-app1    # the network resilience system only
 make h200-check   # run all twenty kernel variants and check each one
-make h200-sweep   # run the App1 sweep reported in the paper
+make h200-sweep   # run the App1 chain sweep, the validation set
 make h200-sweep2  # run the App2 sweep reported in the paper
 make h200-clean   # remove this machine's binaries and nothing else
 ```
@@ -193,8 +193,10 @@ rebuilds:
 ./App1/floyd_warshall_routing-h200 --nodes 24000 --layout coalesced --dpx on --trials 10 --warmup 1 --energy --csv Results/my_run_h200.csv
 ```
 
-The sweep reported in the paper is `make h200-sweep` or `make a100-sweep`, which fills these flags
-in for you and writes one file per machine under `Results/`.
+`make h200-sweep` and `make a100-sweep` fill these flags in for you and write one file per
+machine under `Results/`. The routing series reported in the paper were measured on the generated
+scale-free topology by `debug/run_scalefree_app1.sh`; the table under **Reproducing the paper
+results** names the file and the command behind each series.
 
 If you call the program directly, give each machine its own `--csv` file. Two runs appending to one
 file on a shared file system interleave their rows and can tear a line. Every row records the GPU it
@@ -245,7 +247,7 @@ Nothing needs recompiling to move between points. Every configuration in the pap
 and the Makefile's sweep targets encode the reported protocol so a whole sweep is one command:
 
 ```bash
-make h200-sweep     # the App1 sweep, every topology size, both DPX states
+make h200-sweep     # the App1 chain sweep, every topology size, both DPX states
 make h200-sweep2    # the App2 sweep, both configurations, every signature count
 ```
 
@@ -260,6 +262,34 @@ and the same two with `a100`. What those targets set:
 
 Override any of them with `SWEEP_NODES`, `SWEEP_TRIALS`, `SWEEP_WARMUP`, `SWEEP_FLAGS`, `SWEEP_CSV`
 and the `SWEEP2_` equivalents.
+
+### The file and the command behind each reported series
+
+Every plotted series and every number quoted in the paper comes from one of the files below, all
+under `Results/`. Each file also records the parameters of its own runs in every row, so a row can
+be checked against this table. All timing and energy runs use five measured trials after one
+unmeasured warm-up; the detection runs use one trial per payload, because they measure what is
+detected rather than how long it takes.
+
+| Reported series | File | How it was produced |
+|---|---|---|
+| Routing on the DPA (H200), time and energy, both DPX arms | `app1_scalefree_energy_h200.csv` | `./debug/run_scalefree_app1.sh h200`, tiled stage: `--layout tiled --store changed --sync per-launch --topology scale-free --energy`, 1000 to 24000 vertices |
+| Routing on the GPGPU (A100), time and energy, both DPX arms | `app1_scalefree_energy_a100.csv` | `./debug/run_scalefree_app1.sh a100`, the same stage |
+| Routing, coalesced layout on both GPUs, the layout comparison | `app1_scalefree_flat_h200.csv`, `app1_scalefree_flat_a100.csv` | the same driver, flat stage: `--layout coalesced --store changed --sync per-launch --topology scale-free` |
+| Routing on the CPU, EPYC 9355, 16 and 32 threads | `app1_scalefree_cpu_h200.csv` | the same driver's CPU stages: `--cpu --topology scale-free --no-verify` with `OMP_NUM_THREADS` 32 and then 16 |
+| Routing on the CPU, EPYC 7302P, 16 threads, time and RAPL energy | `app1_scalefree_cpu_epyc.csv` | `./debug/run_scalefree_app1.sh epyc`, which adds `--energy` |
+| DPI partial matching, time on both GPUs, both DPX arms | `app2_sw_final_h200.csv`, `app2_sw_final_a100.csv` | `make h200-sweep2` and `make a100-sweep2`: `--mode literal --rows registers --alpha 0.8 --block 32`, 10K to 50M signatures, (512, 16) and (1024, 32) |
+| DPI partial matching, a second sweep of the same binary | `app2_sw_final_h200_rep.csv`, `app2_sw_final_a100_rep.csv` | the same targets run again, with `SWEEP2_CSV` naming the new file |
+| DPI regex, time on both GPUs, both DPX arms | `app2_sw_regex_h200.csv`, `app2_sw_regex_a100.csv` | `make <machine>-sweep2 SWEEP2_FLAGS="--mode regex --rows registers"` |
+| DPI partial matching, energy on both GPUs, both DPX arms | `app2_sw_energy_h200.csv`, `app2_sw_energy_a100.csv` | `make <machine>-sweep2 SWEEP2_FLAGS="--mode literal --rows registers --energy --min-window 2.0"`; the `repeat` column records how many scans filled the window |
+| DPI detection quality | `app2_sw_detection_h200.csv` | `./debug/run_detection_quality.sh h200`: 10000 signatures, both modes, both configurations, alpha 0.50 to 0.95, 100 seeds, each payload scanned with and without `--plant`; the paper reports the `lower26` and `ascii95` alphabets, and the file also holds an unfinished `bytes256` sweep |
+| DPI on the CPU, EPYC 9355, 32 threads | `app2_cpu_h200.csv` | the DPI program run directly, with no driver script: `--cpu --mode literal --alpha 0.8 --signatures <N> --payload <P> --sig-len <L> --trials 5 --warmup 1` under `OMP_NUM_THREADS=32`, over the same signature counts and configurations, as the rows of the file record |
+| DPI on the CPU, EPYC 7302P, 16 threads, time and RAPL energy | `app2_cpu_epyc.csv` | the same with `--energy` and `OMP_NUM_THREADS=16` |
+
+The two DPI CPU files were measured on 2026-09-08, before commit `a7dc195` moved the score term
+onto the diagonal transition; they were retained. That change alters which neighbour supplies the
+score term in each cell, not the number of cells computed, so the cell updates per scan are unchanged. Every
+GPU file above was measured after it.
 
 **A sweep refuses to run on a GPU another process is computing on.** A timing measurement taken
 beside another job reports the sharing rather than the program, and the results file it writes cannot
