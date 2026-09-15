@@ -9,16 +9,16 @@
 #
 # Usage, from the root of the clone, one argument naming the machine:
 #
-#   ./debug/run_scalefree_app1.sh h200   the H200 and the EPYC 9355 hosting it
-#   ./debug/run_scalefree_app1.sh a100   the A100
-#   ./debug/run_scalefree_app1.sh epyc   the EPYC 7302P, timing and energy
+#   ./scripts/run_scalefree_app1.sh h200   the H200 and the EPYC 9355 hosting it
+#   ./scripts/run_scalefree_app1.sh a100   the A100
+#   ./scripts/run_scalefree_app1.sh epyc   the EPYC 7302P, timing and energy
 #
 # On a node shared with other users, name a free card first, because a sweep now
 # refuses to run on a card somebody else is computing on. The variable reaches
 # the sweeps through the environment and needs nothing added here:
 #
 #   nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv
-#   SWEEP_GPU=3 ./debug/run_scalefree_app1.sh a100
+#   SWEEP_GPU=3 ./scripts/run_scalefree_app1.sh a100
 #
 # Each stage is independent and a failure in one does not stop the rest, because
 # this is meant to be started and left. The summary at the end says which stages

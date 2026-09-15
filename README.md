@@ -195,7 +195,7 @@ rebuilds:
 
 `make h200-sweep` and `make a100-sweep` fill these flags in for you and write one file per
 machine under `Results/`. The routing series reported in the paper were measured on the generated
-scale-free topology by `debug/run_scalefree_app1.sh`; the table under **Reproducing the paper
+scale-free topology by `scripts/run_scalefree_app1.sh`; the table under **Reproducing the paper
 results** names the file and the command behind each series.
 
 If you call the program directly, give each machine its own `--csv` file. Two runs appending to one
@@ -273,16 +273,16 @@ detected rather than how long it takes.
 
 | Reported series | File | How it was produced |
 |---|---|---|
-| Routing on the DPA (H200), time and energy, both DPX arms | `app1_scalefree_energy_h200.csv` | `./debug/run_scalefree_app1.sh h200`, tiled stage: `--layout tiled --store changed --sync per-launch --topology scale-free --energy`, 1000 to 24000 vertices |
-| Routing on the GPGPU (A100), time and energy, both DPX arms | `app1_scalefree_energy_a100.csv` | `./debug/run_scalefree_app1.sh a100`, the same stage |
+| Routing on the DPA (H200), time and energy, both DPX arms | `app1_scalefree_energy_h200.csv` | `./scripts/run_scalefree_app1.sh h200`, tiled stage: `--layout tiled --store changed --sync per-launch --topology scale-free --energy`, 1000 to 24000 vertices |
+| Routing on the GPGPU (A100), time and energy, both DPX arms | `app1_scalefree_energy_a100.csv` | `./scripts/run_scalefree_app1.sh a100`, the same stage |
 | Routing, coalesced layout on both GPUs, the layout comparison | `app1_scalefree_flat_h200.csv`, `app1_scalefree_flat_a100.csv` | the same driver, flat stage: `--layout coalesced --store changed --sync per-launch --topology scale-free` |
 | Routing on the CPU, EPYC 9355, 16 and 32 threads | `app1_scalefree_cpu_h200.csv` | the same driver's CPU stages: `--cpu --topology scale-free --no-verify` with `OMP_NUM_THREADS` 32 and then 16 |
-| Routing on the CPU, EPYC 7302P, 16 threads, time and RAPL energy | `app1_scalefree_cpu_epyc.csv` | `./debug/run_scalefree_app1.sh epyc`, which adds `--energy` |
+| Routing on the CPU, EPYC 7302P, 16 threads, time and RAPL energy | `app1_scalefree_cpu_epyc.csv` | `./scripts/run_scalefree_app1.sh epyc`, which adds `--energy` |
 | DPI partial matching, time on both GPUs, both DPX arms | `app2_sw_final_h200.csv`, `app2_sw_final_a100.csv` | `make h200-sweep2` and `make a100-sweep2`: `--mode literal --rows registers --alpha 0.8 --block 32`, 10K to 50M signatures, (512, 16) and (1024, 32) |
 | DPI partial matching, a second sweep of the same binary | `app2_sw_final_h200_rep.csv`, `app2_sw_final_a100_rep.csv` | the same targets run again, with `SWEEP2_CSV` naming the new file |
 | DPI regex, time on both GPUs, both DPX arms | `app2_sw_regex_h200.csv`, `app2_sw_regex_a100.csv` | `make <machine>-sweep2 SWEEP2_FLAGS="--mode regex --rows registers"` |
 | DPI partial matching, energy on both GPUs, both DPX arms | `app2_sw_energy_h200.csv`, `app2_sw_energy_a100.csv` | `make <machine>-sweep2 SWEEP2_FLAGS="--mode literal --rows registers --energy --min-window 2.0"`; the `repeat` column records how many scans filled the window |
-| DPI detection quality | `app2_sw_detection_h200.csv` | `./debug/run_detection_quality.sh h200`: 10000 signatures, both modes, both configurations, alpha 0.50 to 0.95, 100 seeds, each payload scanned with and without `--plant`; the paper reports the `lower26` and `ascii95` alphabets, and the file also holds an unfinished `bytes256` sweep |
+| DPI detection quality | `app2_sw_detection_h200.csv` | `./scripts/run_detection_quality.sh h200`: 10000 signatures, both modes, both configurations, alpha 0.50 to 0.95, 100 seeds, each payload scanned with and without `--plant`; the paper reports the `lower26` and `ascii95` alphabets, and the file also holds an unfinished `bytes256` sweep |
 | DPI on the CPU, EPYC 9355, 32 threads | `app2_cpu_h200.csv` | the DPI program run directly, with no driver script: `--cpu --mode literal --alpha 0.8 --signatures <N> --payload <P> --sig-len <L> --trials 5 --warmup 1` under `OMP_NUM_THREADS=32`, over the same signature counts and configurations, as the rows of the file record |
 | DPI on the CPU, EPYC 7302P, 16 threads, time and RAPL energy | `app2_cpu_epyc.csv` | the same with `--energy` and `OMP_NUM_THREADS=16` |
 

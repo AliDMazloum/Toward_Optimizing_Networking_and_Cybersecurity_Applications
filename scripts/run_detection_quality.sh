@@ -27,9 +27,9 @@
 #
 # Usage, from the root of the clone:
 #
-#   ./debug/run_detection_quality.sh h200
-#   SWEEP_GPU=3 ./debug/run_detection_quality.sh a100
-#   SEEDS=20 ./debug/run_detection_quality.sh h200      a short rehearsal
+#   ./scripts/run_detection_quality.sh h200
+#   SWEEP_GPU=3 ./scripts/run_detection_quality.sh a100
+#   SEEDS=20 ./scripts/run_detection_quality.sh h200      a short rehearsal
 #
 # Unlike the sweeps, this does not refuse a card another job is on, and the
 # difference is deliberate: it measures which payloads are detected, not how
