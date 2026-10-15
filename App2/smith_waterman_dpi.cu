@@ -57,6 +57,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <time.h>
+#include <regex.h>
 
 #include <nvml.h>
 #include <cuda_runtime.h>
@@ -70,17 +71,17 @@
 //
 // Literal mode adds 1 per matching character, on the diagonal only, so a
 // signature's maximum score is its length and the threshold is a fraction of
-// that length. Regex mode uses the larger match reward so that wildcard
-// positions, which contribute 0, still leave literal matches room to
-// dominate; its maximum is RE_MATCH times the literal count.
+// that length. Regex mode rewards every signature position that consumes one
+// payload byte, literal or not, and nothing for *; its maximum is RE_MATCH
+// times the number of positions other than *.
 // ---------------------------------------------------------------------------
 
 #define LIT_MATCH     1   // literal mode: diagonal score for a matching character
 #define LIT_MISMATCH -2   // literal mode: diagonal score for a mismatch
 #define LIT_GAP      -1   // literal mode: penalty for a vertical or horizontal move
 
-#define RE_MATCH      6   // regex mode: diagonal score for a matching literal
-#define RE_MISMATCH  -3   // regex mode: diagonal score for a mismatched literal
+#define RE_MATCH      6   // regex mode: diagonal score for a matching position
+#define RE_MISMATCH  -3   // regex mode: diagonal score for a mismatched position
 #define RE_INDEL     -2   // regex mode: gap penalty, 0 in a * column
 
 // Signature lengths the register-row kernel is compiled for. The DP rows and
@@ -287,17 +288,24 @@ static void power_dump_csv(const char *path)
 //
 // The character score enters on the diagonal only, so a signature position is
 // credited at most once per alignment and a score never exceeds the match
-// reward times the literal count. Literal mode scores LIT_MATCH or
-// LIT_MISMATCH and charges LIT_GAP. Regex mode, by signature character:
+// reward times the number of credited positions. Literal mode scores
+// LIT_MATCH or LIT_MISMATCH and charges LIT_GAP. Regex mode, by signature
+// character:
 //
 //   literal   RE_MATCH or RE_MISMATCH, gap RE_INDEL
 //   *         score 0 and gap 0, so it absorbs any run of payload bytes,
-//             including none
-//   .         score 0 against any byte, gap RE_INDEL
-//   ~         score 0 against a digit and RE_MISMATCH otherwise, gap RE_INDEL
+//             including none (the glob *, the regex .*)
+//   .         RE_MATCH against any byte, gap RE_INDEL
+//   ~         RE_MATCH against a digit and RE_MISMATCH otherwise, gap RE_INDEL
+//
+// A regex signature containing an operator is detected only at its maximum,
+// RE_MATCH times its positions other than *. Every step on a path to that
+// score is then a credited diagonal or a free move in a * column, so the
+// signature is detected exactly when the payload contains a substring it
+// matches. A signature of literals only is detected at alpha of its maximum.
 //
 // Every payload byte enters the recurrence, and both modes test the newly
-// computed cell: literal with strict greater-than against floor(alpha * L),
+// computed cell: literal with strict greater-than against ceil(alpha * L) - 1,
 // regex with greater-or-equal against a per-signature threshold.
 //
 // The score functions are shared, host and device, so the host reference and
@@ -317,8 +325,9 @@ __host__ __device__ __forceinline__ int score_literal(char p, char s)
 
 __host__ __device__ __forceinline__ int score_regex(char p, char s, bool p_is_digit)
 {
-    if (s == '*' || s == '.') return 0;
-    if (s == '~') return p_is_digit ? 0 : RE_MISMATCH;
+    if (s == '*') return 0;
+    if (s == '.') return RE_MATCH;
+    if (s == '~') return p_is_digit ? RE_MATCH : RE_MISMATCH;
     return p == s ? RE_MATCH : RE_MISMATCH;
 }
 
@@ -665,15 +674,21 @@ static void rapl_accumulate(void)
     }
 }
 
+static pthread_mutex_t g_rapl_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static void *rapl_polling_func(void *unused)
 {
     (void)unused;
-    while (g_rapl_running) {
+    for (;;) {
         struct timespec ts;
         ts.tv_sec  = RAPL_POLL_MS / 1000;
         ts.tv_nsec = (RAPL_POLL_MS % 1000) * 1000000L;
         nanosleep(&ts, NULL);
-        rapl_accumulate();
+        pthread_mutex_lock(&g_rapl_lock);
+        const bool running = g_rapl_running;
+        if (running) rapl_accumulate();
+        pthread_mutex_unlock(&g_rapl_lock);
+        if (!running) break;
     }
     return NULL;
 }
@@ -690,16 +705,20 @@ static void rapl_begin(void)
     }
 }
 
-// Joules over all packages since rapl_begin, unwrapped per package. The poller
-// is stopped and joined first, so the final accumulate races with nothing.
+// Joules over all packages since rapl_begin, unwrapped per package. The final
+// read is taken here, when the window closes, under the lock the poller holds
+// while it reads, and the poller is stopped in the same step, so its last
+// sleep, which can end up to RAPL_POLL_MS later, adds nothing to the window.
 static double rapl_end_joules(void)
 {
-    if (g_rapl_running) {
-        g_rapl_running = false;
-        pthread_join(g_rapl_thread, NULL);
-    }
+    pthread_mutex_lock(&g_rapl_lock);
     rapl_accumulate();
-    return (double)g_rapl_total_uj / 1e6;
+    const double joules = (double)g_rapl_total_uj / 1e6;
+    const bool was_running = g_rapl_running;
+    g_rapl_running = false;
+    pthread_mutex_unlock(&g_rapl_lock);
+    if (was_running) pthread_join(g_rapl_thread, NULL);
+    return joules;
 }
 
 // Names how the host path runs, for the header and the csv: the OpenMP
@@ -734,7 +753,7 @@ static const char *cpu_desc(void)
 //
 // Two interactions to keep in mind when comparing across alphabets. The larger
 // alphabets contain the three regex metacharacters, so in regex mode a random
-// signature can acquire a wildcard and fall under the full-literal-score rule
+// signature can acquire a wildcard and fall under the full-score rule
 // instead of the alpha rule. And a signature drawn from the whole byte range can
 // contain a zero byte, which nothing here treats as a terminator, because every
 // length is carried explicitly.
@@ -791,8 +810,8 @@ static void fill_random_bytes(char *dst, int n)
     }
 }
 
-// Each signature reaches its full literal score against its payload text, so
-// a planted pair is detectable under the full-literal-score threshold.
+// Each signature matches its payload text, so a planted pair reaches the
+// full-score threshold.
 static const char REGEX_SIG_16[] = "goo.leM*l.ci*c~m";
 static const char REGEX_PAT_16[] = "goosleMaliciou.c1m";
 static const char REGEX_SIG_32[] = "This*malware*fro*goo.leM*l.c*c~m";
@@ -806,24 +825,175 @@ static int literal_count(const char *sig, int L)
     return n;
 }
 
-// Literal mode: the kernel tests the cell against alpha * L; for integer
-// scores that is strict > against floor(alpha * L), which is what is passed
-// to the kernel.
+// Positions an alignment has to consume: every one except *.
+static int required_count(const char *sig, int L)
+{
+    int n = 0;
+    for (int j = 0; j < L; j++)
+        if (sig[j] != '*') n++;
+    return n;
+}
+
+// Literal mode detects a score of at least ceil(alpha * L), so alpha = 1
+// detects an exact match. The kernel tests strict >, so it is passed one less.
+// The small offset keeps a product that should be an integer from rounding up.
 static int literal_threshold(int L, double alpha)
 {
-    return (int)floor(alpha * (double)L);
+    return (int)ceil(alpha * (double)L - 1e-9) - 1;
 }
 
 // Regex mode: a signature made only of literals gets alpha of its maximum
-// score with integer truncation (count * RE_MATCH * pct / 100, pct = alpha
-// as a percentage); a signature containing any wildcard must reach its full
-// literal score.
+// score, rounded up as in literal mode; a
+// signature containing any operator must reach its maximum, RE_MATCH for
+// every position other than *.
 static int regex_threshold(const char *sig, int L, double alpha)
 {
     const int count = literal_count(sig, L);
-    const int pct   = (int)(alpha * 100.0 + 0.5);
-    if (count == L) return count * RE_MATCH * pct / 100;
-    return count * RE_MATCH;
+    if (count == L) return (int)ceil(alpha * RE_MATCH * count - 1e-9);
+    return required_count(sig, L) * RE_MATCH;
+}
+
+// ---------------------------------------------------------------------------
+// Self-test
+//
+// Checks the host reference, which every GPU run is verified against, with a
+// matcher that shares nothing with it: the POSIX regular expression library.
+// A regex signature is translated to an extended regular expression (* to .*,
+// . to ., ~ to [0-9], every literal escaped) and searched for anywhere in the
+// payload; the detector, at its full-score threshold, has to agree on every
+// case. Literal mode is checked at the threshold boundary: a payload holding
+// the first k characters of a signature of distinct characters scores exactly
+// k, so it has to be detected when k reaches ceil(alpha * L) and not when it
+// falls one short.
+// ---------------------------------------------------------------------------
+
+static void to_ere(const char *sig, int L, char *out)
+{
+    char *o = out;
+    for (int j = 0; j < L; j++) {
+        const char c = sig[j];
+        if (c == '*')      { *o++ = '.'; *o++ = '*'; }
+        else if (c == '.') { *o++ = '.'; }
+        else if (c == '~') { memcpy(o, "[0-9]", 5); o += 5; }
+        else {
+            if (strchr("\\^$.[]|()*+?{}", c) != NULL) *o++ = '\\';
+            *o++ = c;
+        }
+    }
+    *o = '\0';
+}
+
+static bool selftest_regex_case(const char *sig, const char *payload, bool show)
+{
+    const int L = (int)strlen(sig);
+    const int P = (int)strlen(payload);
+    char ere[5 * MAX_SIG_LEN + 1];
+    to_ere(sig, L, ere);
+
+    regex_t re;
+    if (regcomp(&re, ere, REG_EXTENDED | REG_NOSUB) != 0) {
+        fprintf(stderr, "regcomp failed on %s\n", ere);
+        exit(1);
+    }
+    const bool want = regexec(&re, payload, 0, NULL, 0) == 0;
+    regfree(&re);
+
+    int score, pos, best;
+    const bool got = host_scan_signature(true, payload, P, sig, L,
+                                         regex_threshold(sig, L, 1.0),
+                                         &score, &pos, &best);
+    if (show || got != want)
+        printf("  %-34s %-46s reference %-8s detector %-8s%s\n", sig, payload,
+               want ? "match" : "no match", got ? "match" : "no match",
+               got == want ? "" : "  DISAGREE");
+    return got == want;
+}
+
+static bool run_selftest(void)
+{
+    // Signature, payload. Mandatory class, single-symbol wildcard, operators
+    // at either end, operator-only signatures, the run wildcard, incomplete
+    // matches, operator bytes in the payload, and the two planted pairs.
+    static const char *cases[][2] = {
+        { "a~",   "xxa1x" }, { "a~",   "xxaxx" }, { "~a",  "x1ax" },
+        { "~a",   "xxax"  }, { "a~b",  "a1b"   }, { "a~b", "ab"   },
+        { "a~b",  "axb"   }, { "a.b",  "axb"   }, { "a.b", "ab"   },
+        { "a.b",  "axxb"  }, { "a.",   "a"     }, { "a.",  "ab"   },
+        { ".a",   "a"     }, { ".a",   "ba"    }, { "~",   "abc"  },
+        { "~",    "ab1"   }, { ".",    "x"     }, { "..",  "x"    },
+        { "*",    "x"     }, { "~*~",  "1xx2"  }, { "~*~", "1xx"  },
+        { "a*b",  "ab"    }, { "a*b",  "axxxb" }, { "a*b", "ba"   },
+        { "abcd", "xxabcx" }, { "abc~", "abc"  }, { "abc~", "ab1" },
+        { "a.b",  "a.b"   }, { "a~",   "a~"    },
+        { REGEX_SIG_16, REGEX_PAT_16 }, { REGEX_SIG_32, REGEX_PAT_32 },
+    };
+    const int n_cases = (int)(sizeof cases / sizeof cases[0]);
+    int bad = 0;
+
+    printf("# selftest: regex mode against POSIX regexec, targeted cases\n");
+    for (int k = 0; k < n_cases; k++)
+        if (!selftest_regex_case(cases[k][0], cases[k][1], true)) bad++;
+
+    const int n_random = 200000;
+    int bad_random = 0;
+    srand(12345);
+    for (int k = 0; k < n_random; k++) {
+        char sig[9], payload[13];
+        const int L = 1 + rand() % 8;
+        const int P = 1 + rand() % 12;
+        for (int j = 0; j < L; j++) sig[j] = "ab1*.~"[rand() % 6];
+        for (int i = 0; i < P; i++) payload[i] = "ab12"[rand() % 4];
+        sig[L] = '\0';
+        payload[P] = '\0';
+        if (!selftest_regex_case(sig, payload, false)) bad_random++;
+    }
+    printf("# selftest: regex mode, %d random cases, %d disagreements\n",
+           n_random, bad_random);
+    bad += bad_random;
+
+    static const double alphas[] = { 0.5, 0.6, 0.65625, 0.7, 0.8, 0.9, 0.95, 1.0 };
+    static const char distinct[] = "abcdefghijklmnopqrstuvwxyzABCDEF";
+    int bad_lit = 0, n_lit = 0;
+    for (int b = 0; b < 2; b++) {
+        const int L = b ? SIG_LEN_B : SIG_LEN_A;
+        for (size_t a = 0; a < sizeof alphas / sizeof alphas[0]; a++) {
+            const int need = (int)ceil(alphas[a] * (double)L - 1e-9);
+            // A regex signature of literals only uses the same rounding.
+            const int re_need = (int)ceil(alphas[a] * RE_MATCH * L - 1e-9);
+            n_lit++;
+            if (regex_threshold(distinct, L, alphas[a]) != re_need) {
+                bad_lit++;
+                printf("  regex literal-only L=%d alpha=%g: threshold %d,"
+                       " expected %d  DISAGREE\n", L, alphas[a],
+                       regex_threshold(distinct, L, alphas[a]), re_need);
+            }
+            for (int k = need - 1; k <= need; k++) {
+                char payload[MAX_SIG_LEN + 5];
+                memcpy(payload, "##", 2);
+                memcpy(payload + 2, distinct, (size_t)k);
+                memcpy(payload + 2 + k, "##", 2);
+                int score, pos, best;
+                const bool got = host_scan_signature(false, payload, k + 4,
+                                                     distinct, L,
+                                                     literal_threshold(L, alphas[a]),
+                                                     &score, &pos, &best);
+                n_lit++;
+                if (got != (k >= need)) {
+                    bad_lit++;
+                    printf("  literal L=%d alpha=%g prefix %d: detector %s,"
+                           " expected %s  DISAGREE\n", L, alphas[a], k,
+                           got ? "match" : "no match",
+                           k >= need ? "match" : "no match");
+                }
+            }
+        }
+    }
+    printf("# selftest: literal mode, %d threshold boundary cases, %d wrong\n",
+           n_lit, bad_lit);
+    bad += bad_lit;
+
+    printf("# selftest: %s\n", bad == 0 ? "PASS" : "FAIL");
+    return bad == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -964,9 +1134,9 @@ static void print_usage(const char *prog)
     printf("  --dpx <state>       on | off (default on)\n");
     printf("  --alpha <float>     detection threshold fraction, in (0, 1]\n");
     printf("                      (default 0.8): literal detects when a\n");
-    printf("                      cell score exceeds alpha * length; a regex\n");
-    printf("                      signature with wildcards needs its full\n");
-    printf("                      literal score\n");
+    printf("                      cell score reaches alpha * length; a regex\n");
+    printf("                      signature with an operator needs its full\n");
+    printf("                      score, a match of the whole pattern\n");
     printf("  --block <int>       threads per block (default 32)\n");
     printf("  --exit <policy>     first | never: a matching thread stops at its\n");
     printf("                      first report, or scans everything (default first)\n");
@@ -981,6 +1151,9 @@ static void print_usage(const char *prog)
     printf("  --min-window <sec>  choose --repeat from the warm-up scan, so\n");
     printf("                      the window reaches this length (default 0,\n");
     printf("                      off). Needs at least one warm-up.\n");
+    printf("  --selftest          check the host reference against the POSIX\n");
+    printf("                      regex library and the literal thresholds,\n");
+    printf("                      then exit\n");
     printf("  --cpu               run the host reference instead of the GPU\n");
     printf("                      (OpenMP when the build enables it, else serial)\n");
     printf("  --energy            report per-trial energy: NVML power sampling\n");
@@ -1071,6 +1244,8 @@ int main(int argc, char **argv)
             min_window_s = atof(argv[++i]);
         } else if (!strcmp(argv[i], "--warmup") && i + 1 < argc) {
             warmup = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--selftest")) {
+            return run_selftest() ? 0 : 1;
         } else if (!strcmp(argv[i], "--cpu")) {
             run_cpu = true;
         } else if (!strcmp(argv[i], "--energy")) {
@@ -1211,8 +1386,7 @@ int main(int argc, char **argv)
         } else {
             // The planted signature's text becomes the start of the payload,
             // and every one of its L characters scores, so a perfect plant
-            // reaches L. The test is strict against floor(alpha * L), so it is
-            // detected at every alpha below 1.0.
+            // reaches L, which is detected at every alpha.
             memcpy(payload, slot_p, (size_t)L);
         }
     }
@@ -1349,15 +1523,18 @@ int main(int argc, char **argv)
            alphabet_size(g_alphabet));
     printf("# alpha             : %g\n", alpha);
     if (regex_mode) {
-        // Every random signature is all-literal, so any non-planted slot
-        // shows the threshold they all share.
-        const long long rnd = (plant == 0) ? 1 : 0;
+        // The threshold every random signature without an operator shares;
+        // one with an operator, which the wider alphabets can draw, needs its
+        // full score instead.
+        char lit_sig[MAX_SIG_LEN];
+        memset(lit_sig, 'a', sizeof lit_sig);
+        const int lit_thr = regex_threshold(lit_sig, L, alpha);
         if (plant >= 0)
-            printf("# threshold         : %d (planted regex), %d (random signatures)\n",
-                   thresholds[plant], thresholds[rnd]);
+            printf("# threshold         : %d (planted regex), %d (random signatures"
+                   " without an operator)\n", thresholds[plant], lit_thr);
         else
-            printf("# threshold         : %d (random signatures)\n",
-                   thresholds[rnd]);
+            printf("# threshold         : %d (random signatures without an"
+                   " operator)\n", lit_thr);
     } else {
         printf("# threshold         : score > %d, of a maximum %d\n",
                threshold_lit, L);
@@ -1591,7 +1768,9 @@ int main(int argc, char **argv)
         // many scans the window held, so its length is recoverable.
         const double per = (double)repeat;
         kernel_s[t]   = kernel_seconds / per;
-        endtoend_s[t] = (t1 - t0) / per;
+        // The payload upload and the report copy happen once per window
+        // however many scans it holds, so they are counted once.
+        endtoend_s[t] = (t1 - t0) - kernel_seconds + kernel_s[t];
 
         int nsamp = 0;
         if (measure_energy && !run_cpu) {

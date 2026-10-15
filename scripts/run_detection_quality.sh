@@ -58,7 +58,7 @@ esac
 #             and the count has to be quoted with it.
 #   CONFIGS   both (payload, signature length) pairs the reported sweeps use.
 #   ALPHAS    the reported threshold, 0.8, with a spread either side of it.
-#             The threshold the kernel applies is floor(alpha * L), so alpha
+#             Detection needs a score of ceil(alpha * L), so alpha
 #             steps finer than 1/L land on the same integer and buy nothing:
 #             at length 16 the distinct thresholds are 8/16 through 16/16.
 #             A grid in steps of 1/32 resolves both signature lengths, at
@@ -190,9 +190,9 @@ plant different things, so they answer different questions.
 
 In literal mode the planted signature's own text is copied into the payload and
 every one of its characters scores, so a perfect plant reaches its full length.
-The test is strict against floor(alpha * L), so it is detected at every alpha
-below 1.0 and the true positive rate should be 1 throughout. A false negative
-below alpha 1.0 means something is wrong, not that the threshold was strict.
+Detection needs a score of ceil(alpha * L), so it is detected at every alpha
+and the true positive rate should be 1 throughout. A false negative means
+something is wrong.
 
 That was not always so. The payload loop used to start at the second byte, so
 the plant could reach only L-1 and nothing cleared alpha 0.95 at length 16. If
@@ -200,7 +200,8 @@ this table shows a true positive rate under 1 at a high alpha, check that the
 binary is newer than that change rather than looking for a cause in the data.
 
 In regex mode the planted signature contains wildcards, and the scoring rule
-requires a signature with any wildcard to reach its full literal score. Alpha
+requires a signature with any operator to reach its full score, a match of
+the whole pattern. Alpha
 does not enter that test at all, so the true positive rate is 1 at every alpha
 by construction. That is worth reporting rather than hiding: it says the
 formulation makes a wildcard signature's detection threshold-independent, and

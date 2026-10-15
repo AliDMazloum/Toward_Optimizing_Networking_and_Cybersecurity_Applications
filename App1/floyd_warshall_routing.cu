@@ -520,15 +520,21 @@ static void rapl_accumulate(void)
     }
 }
 
+static pthread_mutex_t g_rapl_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static void *rapl_polling_func(void *unused)
 {
     (void)unused;
-    while (g_rapl_running) {
+    for (;;) {
         struct timespec ts;
         ts.tv_sec  = RAPL_POLL_MS / 1000;
         ts.tv_nsec = (RAPL_POLL_MS % 1000) * 1000000L;
         nanosleep(&ts, NULL);
-        rapl_accumulate();
+        pthread_mutex_lock(&g_rapl_lock);
+        const bool running = g_rapl_running;
+        if (running) rapl_accumulate();
+        pthread_mutex_unlock(&g_rapl_lock);
+        if (!running) break;
     }
     return NULL;
 }
@@ -545,16 +551,20 @@ static void rapl_begin(void)
     }
 }
 
-// Joules over all packages since rapl_begin, unwrapped per package. The poller
-// is stopped and joined first, so the final accumulate races with nothing.
+// Joules over all packages since rapl_begin, unwrapped per package. The final
+// read is taken here, when the window closes, under the lock the poller holds
+// while it reads, and the poller is stopped in the same step, so its last
+// sleep, which can end up to RAPL_POLL_MS later, adds nothing to the window.
 static double rapl_end_joules(void)
 {
-    if (g_rapl_running) {
-        g_rapl_running = false;
-        pthread_join(g_rapl_thread, NULL);
-    }
+    pthread_mutex_lock(&g_rapl_lock);
     rapl_accumulate();
-    return (double)g_rapl_total_uj / 1e6;
+    const double joules = (double)g_rapl_total_uj / 1e6;
+    const bool was_running = g_rapl_running;
+    g_rapl_running = false;
+    pthread_mutex_unlock(&g_rapl_lock);
+    if (was_running) pthread_join(g_rapl_thread, NULL);
+    return joules;
 }
 
 // Host reference, used to check the GPU result and as the CPU baseline: the

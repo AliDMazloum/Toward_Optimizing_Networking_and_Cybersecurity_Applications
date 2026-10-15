@@ -165,7 +165,7 @@ as comment lines, which means the output documents the configuration that produc
 | `--signatures <int>` | Number of signatures, even. Default 20000000. |
 | `--payload <int>` | Payload length in bytes. Default 512. |
 | `--sig-len <int>` | Signature length, 16 or 32. Both are compile-time bounds on the register-resident rows. |
-| `--mode <name>` | `literal` or `regex`. Regex adds `*`, `.` and `~`, which score zero and so preserve the reading of the threshold as a fraction of literal agreement. |
+| `--mode <name>` | `literal` or `regex`. Regex adds `*` (any run of bytes), `.` (any one byte) and `~` (one digit). A signature containing one of them is detected only when the payload contains a match of the whole pattern. |
 | `--rows <where>` | `registers` or `global`: where the two DP rows live. |
 | `--dpx <state>` | `on` uses the DPX halfword instructions `__viaddmax_s16x2` and `__viaddmax_s16x2_relu`, packing two signatures into one 32-bit word; `off` computes the same values with ordinary integer operations on the same GPU. |
 | `--alpha <float>` | Detection threshold as a fraction of the maximum score. Default 0.8. |
@@ -179,6 +179,7 @@ as comment lines, which means the output documents the configuration that produc
 | `--energy`, `--poll-ms`, `--power-csv` | NVML power sampling and its interval and dump file. |
 | `--device <int>`, `--seed <int>`, `--csv <path>` | Device, generator seed, and the results file to append to. |
 | `--verify <what>` | `report`, `all` or `off`: recheck the reported crossing, or every signature, against the host reference. |
+| `--selftest` | Check the host reference against the POSIX regular expression library on targeted and random regex cases, and the literal thresholds at their boundary, then exit. Needs no GPU. |
 
 The program prints one row per trial with the kernel and end to end time, and the index, score and
 position of any signature it reported. With verification on it also prints a mismatch count against
@@ -303,8 +304,8 @@ differently and an index that names the free card to one can name a busy card to
 Scoring is the Smith–Waterman recurrence: the match or mismatch score enters on the diagonal only,
 and the gap penalty on the vertical and horizontal moves, so a signature position is credited at most
 once per alignment. Parameters are `match = 1`, `mismatch = -2`, `gap = -1` in literal mode and
-`match = 6`, `mismatch = -3`, `gap = -2` in regex mode, where the three metacharacters score zero and
-`*` also sets its gap to zero.
+`match = 6`, `mismatch = -3`, `gap = -2` in regex mode, where `.` and `~` score as a literal does when
+they match, and `*` scores zero and sets its gap to zero.
 
 ### How time and energy are measured
 
