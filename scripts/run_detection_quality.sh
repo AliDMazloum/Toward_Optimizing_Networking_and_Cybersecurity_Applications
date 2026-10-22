@@ -30,6 +30,12 @@
 #   ./scripts/run_detection_quality.sh h200
 #   SWEEP_GPU=3 ./scripts/run_detection_quality.sh a100
 #   SEEDS=20 ./scripts/run_detection_quality.sh h200      a short rehearsal
+#   ./scripts/run_detection_quality.sh cpu                 the host reference
+#
+# The cpu target runs the program with --cpu, the host reference the kernel is
+# checked against on every GPU run, so it reports the same detections and needs
+# no GPU. Build first with the flags the host needs (see the README); the
+# script's own make then finds the binary up to date.
 #
 # Unlike the sweeps, this does not refuse a card another job is on, and the
 # difference is deliberate: it measures which payloads are detected, not how
@@ -46,7 +52,8 @@ MACHINE=${1:-}
 case "$MACHINE" in
     a100) ARCHES=${ARCHES:-80}; TAG=a100; GPU_MATCH=A100 ;;
     h200) ARCHES=${ARCHES:-90}; TAG=h200; GPU_MATCH=H200 ;;
-    *)    echo "Usage: $0 <a100|h200>" >&2; exit 2 ;;
+    cpu)  ARCHES=${ARCHES:-80}; TAG=${TAG:-epyc}; GPU_MATCH= ;;
+    *)    echo "Usage: $0 <a100|h200|cpu>" >&2; exit 2 ;;
 esac
 
 # Every one of these is overridable, and each is a choice worth seeing rather
@@ -80,12 +87,18 @@ BIN=App2/smith_waterman_dpi-$TAG
 # to bound the false positive rate there. Those want separate files.
 OUT=${OUT:-Results/app2_detection_$TAG.csv}
 
-name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-case "$name" in
-    *$GPU_MATCH*) echo "Node gpu: $name" ;;
-    *) echo "This node reports '$name', not a $GPU_MATCH. Refusing to run." >&2
-       exit 1 ;;
-esac
+cpu_arg=""
+if [ "$MACHINE" = cpu ]; then
+    cpu_arg="--cpu"
+    echo "Host reference, OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset}"
+else
+    name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+    case "$name" in
+        *$GPU_MATCH*) echo "Node gpu: $name" ;;
+        *) echo "This node reports '$name', not a $GPU_MATCH. Refusing to run." >&2
+           exit 1 ;;
+    esac
+fi
 
 if [ -n "${SWEEP_GPU:-}" ]; then
     uuid=$(nvidia-smi -i "$SWEEP_GPU" --query-gpu=uuid --format=csv,noheader 2>/dev/null)
@@ -133,7 +146,7 @@ for alphabet in $ALPHABETS; do
             row=$(./"$BIN" --signatures "$SIGS" --payload "$pay" --sig-len "$len" \
                     --mode "$mode" --rows registers --dpx on --block 32 \
                     --alphabet "$alphabet" --alpha "$alpha" --seed "$seed" \
-                    $plant_arg --trials 1 --warmup 0 --verify report \
+                    $plant_arg $cpu_arg --trials 1 --warmup 0 --verify report \
                     2>/dev/null \
                   | awk -F, '$1 ~ /^[0-9]+$/ { print $4","$5","$6","$7","$8 }' | head -1)
             [ -z "$row" ] && row=",,,,"
