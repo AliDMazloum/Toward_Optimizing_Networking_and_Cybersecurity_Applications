@@ -223,6 +223,7 @@ readable.
 | `--seed <int>` | Scale-free only: generator seed. Default 1. |
 | `--block <int>` | Threads per block for the flat layouts. |
 | `--sync <state>` | `per-launch` or `none`: whether the host synchronizes after each launch. |
+| `--pred` | Tiled layout only: also build the predecessor matrix that path reconstruction needs, inside the same timed windows, and copy it back. Unless `--no-verify` is given, every trial checks that the predecessor of each reachable pair is joined to the destination by an edge and lies one step closer to the source, and the count of failures is written to `pred_mismatches`. The `pred` column records whether it was on. |
 | `--no-verify` | Skip the correctness check. |
 
 The block size is fixed at 256 threads, which performed best in our measurements. The block count is

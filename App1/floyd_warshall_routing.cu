@@ -11,6 +11,10 @@
 //   --dpx    on | off              DPX instruction, or its plain equivalent
 //   --store  always | changed      write every cell, or only the improvements
 //
+// A fourth, --pred, applies to the tiled layout and also builds the
+// predecessor matrix that path reconstruction needs, so its cost can be
+// measured against the same run without it.
+//
 // Every run repeats the whole computation --trials times and reports two
 // timings per trial:
 //
@@ -352,6 +356,16 @@ __global__ void fw_strided(int V, int k, int *dis)
 // fused instruction against an add, a compare and a select. Unlike the
 // conditional store of the flat layouts, the minimum the instruction returns
 // is exactly the value wanted here, so it does no redundant work.
+//
+// PRED also maintains the predecessor matrix P, where P[i][j] is the vertex
+// before j on a shortest path from i to j; following P back from j recovers
+// the path. When the path through k is strictly shorter, P[i][j] becomes
+// P[k][j], so every kernel stages the P tile that holds row k beside the
+// distance tile, and compares the new minimum with the old one to learn
+// whether it improved. The comparison is strict: with <=, the step k = j
+// would tie and set P[i][j] to j itself. The P tiles are sized to one row
+// when PRED is off, so the kernels without it use the shared memory they
+// always did.
 // ---------------------------------------------------------------------------
 
 template <bool USE_DPX>
@@ -362,47 +376,59 @@ __device__ __forceinline__ int add_min(int a, int b, int c)
     return t < c ? t : c;
 }
 
+// Rows of a P tile: a full tile with PRED, one unused row without it.
+#define PTILE_ROWS(PRED) ((PRED) ? TILE : 1)
+
 // Phase 1: the diagonal tile.
-template <bool USE_DPX, bool STORE_CHANGED>
-__global__ void fw_tiled_diag(int Vp, int r, int *dis)
+template <bool USE_DPX, bool STORE_CHANGED, bool PRED>
+__global__ void fw_tiled_diag(int Vp, int r, int *dis, int *pred)
 {
     __shared__ int tile[TILE][TILE];
+    __shared__ int ptile[PTILE_ROWS(PRED)][TILE];
     const int tx = threadIdx.x, ty = threadIdx.y;
     const int base = r * TILE;
     const long long idx = (long long)(base + ty) * Vp + base + tx;
 
     tile[ty][tx] = dis[idx];
+    if constexpr (PRED) ptile[ty][tx] = pred[idx];
     __syncthreads();
     const int before = tile[ty][tx];
 
     for (int kk = 0; kk < TILE; kk++) {
         const int t = add_min<USE_DPX>(tile[ty][kk], tile[kk][tx], tile[ty][tx]);
+        int p = 0;
+        if constexpr (PRED)
+            p = (t < tile[ty][tx]) ? ptile[kk][tx] : ptile[ty][tx];
         __syncthreads();
         tile[ty][tx] = t;
+        if constexpr (PRED) ptile[ty][tx] = p;
         __syncthreads();
     }
 
-    if (STORE_CHANGED) {
-        if (tile[ty][tx] < before) dis[idx] = tile[ty][tx];
-    } else {
+    if (!STORE_CHANGED || tile[ty][tx] < before) {
         dis[idx] = tile[ty][tx];
+        if constexpr (PRED) pred[idx] = ptile[ty][tx];
     }
 }
 
 // Phase 2: block-row r (blockIdx.y == 0) and block-column r (blockIdx.y == 1).
 // The grid x dimension has nb - 1 blocks and skips the diagonal tile.
-template <bool USE_DPX, bool STORE_CHANGED>
-__global__ void fw_tiled_line(int Vp, int r, int *dis)
+template <bool USE_DPX, bool STORE_CHANGED, bool PRED>
+__global__ void fw_tiled_line(int Vp, int r, int *dis, int *pred)
 {
     __shared__ int own[TILE][TILE];
     __shared__ int diag[TILE][TILE];
+    __shared__ int pown[PTILE_ROWS(PRED)][TILE];
+    __shared__ int pdiag[PTILE_ROWS(PRED)][TILE];
     const int tx = threadIdx.x, ty = threadIdx.y;
     const int base = r * TILE;
 
     int m = blockIdx.x;
     if (m >= r) m++;  // skip the diagonal tile
 
-    diag[ty][tx] = dis[(long long)(base + ty) * Vp + base + tx];
+    const long long didx = (long long)(base + ty) * Vp + base + tx;
+    diag[ty][tx] = dis[didx];
+    if constexpr (PRED) pdiag[ty][tx] = pred[didx];
 
     long long idx;
     if (blockIdx.y == 0)  // tile (r, m): the rows are the intermediate vertices
@@ -410,6 +436,7 @@ __global__ void fw_tiled_line(int Vp, int r, int *dis)
     else                  // tile (m, r): the columns are
         idx = (long long)(m * TILE + ty) * Vp + base + tx;
     own[ty][tx] = dis[idx];
+    if constexpr (PRED) pown[ty][tx] = pred[idx];
     __syncthreads();
     const int before = own[ty][tx];
 
@@ -417,24 +444,32 @@ __global__ void fw_tiled_line(int Vp, int r, int *dis)
         const int a = (blockIdx.y == 0) ? diag[ty][kk] : own[ty][kk];
         const int b = (blockIdx.y == 0) ? own[kk][tx]  : diag[kk][tx];
         const int t = add_min<USE_DPX>(a, b, own[ty][tx]);
+        int p = 0;
+        if constexpr (PRED) {
+            // P[k][j] lies in the tile that holds row k: this tile in the
+            // block-row, the diagonal tile in the block-column.
+            const int pk = (blockIdx.y == 0) ? pown[kk][tx] : pdiag[kk][tx];
+            p = (t < own[ty][tx]) ? pk : pown[ty][tx];
+        }
         __syncthreads();
         own[ty][tx] = t;
+        if constexpr (PRED) pown[ty][tx] = p;
         __syncthreads();
     }
 
-    if (STORE_CHANGED) {
-        if (own[ty][tx] < before) dis[idx] = own[ty][tx];
-    } else {
+    if (!STORE_CHANGED || own[ty][tx] < before) {
         dis[idx] = own[ty][tx];
+        if constexpr (PRED) pred[idx] = pown[ty][tx];
     }
 }
 
 // Phase 3: the remaining (nb - 1)^2 tiles. Both grid dimensions skip index r.
-template <bool USE_DPX, bool STORE_CHANGED>
-__global__ void fw_tiled_rest(int Vp, int r, int *dis)
+template <bool USE_DPX, bool STORE_CHANGED, bool PRED>
+__global__ void fw_tiled_rest(int Vp, int r, int *dis, int *pred)
 {
     __shared__ int rowt[TILE][TILE];  // tile (bi, r), holds d[i][kk]
     __shared__ int colt[TILE][TILE];  // tile (r, bj), holds d[kk][j]
+    __shared__ int pcolt[PTILE_ROWS(PRED)][TILE];  // the same tile of P
     const int tx = threadIdx.x, ty = threadIdx.y;
     const int base = r * TILE;
 
@@ -442,20 +477,31 @@ __global__ void fw_tiled_rest(int Vp, int r, int *dis)
     int bj = blockIdx.x; if (bj >= r) bj++;
 
     rowt[ty][tx] = dis[(long long)(bi * TILE + ty) * Vp + base + tx];
-    colt[ty][tx] = dis[(long long)(base + ty) * Vp + bj * TILE + tx];
+    const long long cidx = (long long)(base + ty) * Vp + bj * TILE + tx;
+    colt[ty][tx] = dis[cidx];
+    if constexpr (PRED) pcolt[ty][tx] = pred[cidx];
     __syncthreads();
 
     const long long idx = (long long)(bi * TILE + ty) * Vp + bj * TILE + tx;
     int c = dis[idx];
     const int before = c;
+    // With --store changed, P is written only after an improvement, which
+    // sets p, so the old value is read only when every cell is written.
+    int p = (PRED && !STORE_CHANGED) ? pred[idx] : 0;
 
-    for (int kk = 0; kk < TILE; kk++)
-        c = add_min<USE_DPX>(rowt[ty][kk], colt[kk][tx], c);
+    for (int kk = 0; kk < TILE; kk++) {
+        if constexpr (PRED) {
+            const int n = add_min<USE_DPX>(rowt[ty][kk], colt[kk][tx], c);
+            if (n < c) p = pcolt[kk][tx];
+            c = n;
+        } else {
+            c = add_min<USE_DPX>(rowt[ty][kk], colt[kk][tx], c);
+        }
+    }
 
-    if (STORE_CHANGED) {
-        if (c < before) dis[idx] = c;
-    } else {
+    if (!STORE_CHANGED || c < before) {
         dis[idx] = c;
+        if constexpr (PRED) pred[idx] = p;
     }
 }
 
@@ -731,6 +777,61 @@ static long long count_mismatches_ref(int V, int pitch, const int *dis,
     return bad;
 }
 
+// Initial predecessors, read from the initial distance matrix: i before j
+// when there is an edge from i to j (and on the diagonal), -1 when there is
+// no path yet. Padded cells are -1.
+static void init_pred(int V, int pitch, const int *dis, int *pred)
+{
+    for (int i = 0; i < pitch; i++)
+        for (int j = 0; j < pitch; j++) {
+            const long long c = (long long)i * pitch + j;
+            pred[c] = (i < V && j < V && dis[c] < INF) ? i : -1;
+        }
+}
+
+// The edges of the initial matrix as a V x V bit set, for checking P.
+static unsigned char *edge_bits(int V, int pitch, const int *dis)
+{
+    unsigned char *bits = (unsigned char *)calloc(((size_t)V * V + 7) / 8, 1);
+    if (bits == NULL) {
+        fprintf(stderr, "Edge bit set allocation failed\n");
+        exit(1);
+    }
+    for (int i = 0; i < V; i++)
+        for (int j = 0; j < V; j++)
+            if (i != j && dis[(long long)i * pitch + j] < INF) {
+                const size_t b = (size_t)i * V + j;
+                bits[b / 8] |= (unsigned char)(1u << (b % 8));
+            }
+    return bits;
+}
+
+// Counts the pairs whose predecessor does not lead along a shortest path.
+// Every edge has weight 1, so P is right for (i, j) when P[i][j] = p is a
+// vertex with an edge p -> j and D[i][p] = D[i][j] - 1. Together with correct
+// distances, this makes the walk back from j through P a shortest path to i
+// for every pair, because each step lowers the distance by one.
+static long long count_pred_errors(int V, int pitch, const int *dis,
+                                   const int *pred, const unsigned char *bits)
+{
+    long long bad = 0;
+    for (int i = 0; i < V; i++)
+        for (int j = 0; j < V; j++) {
+            const long long c = (long long)i * pitch + j;
+            const int d = dis[c], p = pred[c];
+            bool ok;
+            if (i == j)        ok = (p == i);
+            else if (d >= INF) ok = (p == -1);
+            else {
+                const size_t b = (size_t)p * V + j;
+                ok = p >= 0 && p < V && (bits[b / 8] >> (b % 8) & 1) &&
+                     dis[(long long)i * pitch + p] == d - 1;
+            }
+            if (!ok) bad++;
+        }
+    return bad;
+}
+
 // ---------------------------------------------------------------------------
 // Launch configuration
 //
@@ -794,32 +895,45 @@ static void launch_relaxation(bool coalesced, bool use_dpx, bool store_changed,
 // One round of the tiled layout: the three phases for diagonal index r. The
 // synchronization option is applied inside, so --sync means the same thing in
 // every layout: a host wait after every kernel launch.
-template <bool USE_DPX, bool STORE_CHANGED>
-static void tiled_round(int nb, int Vp, int r, int *dis_d, bool sync_each)
+template <bool USE_DPX, bool STORE_CHANGED, bool PRED>
+static void tiled_round(int nb, int Vp, int r, int *dis_d, int *pred_d,
+                        bool sync_each)
 {
     const dim3 threads(TILE, TILE);
-    fw_tiled_diag<USE_DPX, STORE_CHANGED><<<1, threads>>>(Vp, r, dis_d);
+    fw_tiled_diag<USE_DPX, STORE_CHANGED, PRED><<<1, threads>>>(Vp, r, dis_d, pred_d);
     if (sync_each) CUDA_CHECK(cudaDeviceSynchronize());
     if (nb > 1) {
-        fw_tiled_line<USE_DPX, STORE_CHANGED>
-            <<<dim3(nb - 1, 2), threads>>>(Vp, r, dis_d);
+        fw_tiled_line<USE_DPX, STORE_CHANGED, PRED>
+            <<<dim3(nb - 1, 2), threads>>>(Vp, r, dis_d, pred_d);
         if (sync_each) CUDA_CHECK(cudaDeviceSynchronize());
-        fw_tiled_rest<USE_DPX, STORE_CHANGED>
-            <<<dim3(nb - 1, nb - 1), threads>>>(Vp, r, dis_d);
+        fw_tiled_rest<USE_DPX, STORE_CHANGED, PRED>
+            <<<dim3(nb - 1, nb - 1), threads>>>(Vp, r, dis_d, pred_d);
         if (sync_each) CUDA_CHECK(cudaDeviceSynchronize());
     }
 }
 
-static void launch_tiled_round(bool use_dpx, bool store_changed,
-                               int nb, int Vp, int r, int *dis_d, bool sync_each)
+template <bool PRED>
+static void launch_tiled_round_p(bool use_dpx, bool store_changed, int nb,
+                                 int Vp, int r, int *dis_d, int *pred_d,
+                                 bool sync_each)
 {
     if (use_dpx) {
-        if (store_changed) tiled_round<true, true>(nb, Vp, r, dis_d, sync_each);
-        else               tiled_round<true, false>(nb, Vp, r, dis_d, sync_each);
+        if (store_changed) tiled_round<true, true, PRED>(nb, Vp, r, dis_d, pred_d, sync_each);
+        else               tiled_round<true, false, PRED>(nb, Vp, r, dis_d, pred_d, sync_each);
     } else {
-        if (store_changed) tiled_round<false, true>(nb, Vp, r, dis_d, sync_each);
-        else               tiled_round<false, false>(nb, Vp, r, dis_d, sync_each);
+        if (store_changed) tiled_round<false, true, PRED>(nb, Vp, r, dis_d, pred_d, sync_each);
+        else               tiled_round<false, false, PRED>(nb, Vp, r, dis_d, pred_d, sync_each);
     }
+}
+
+static void launch_tiled_round(bool use_dpx, bool store_changed, bool track_pred,
+                               int nb, int Vp, int r, int *dis_d, int *pred_d,
+                               bool sync_each)
+{
+    if (track_pred)
+        launch_tiled_round_p<true>(use_dpx, store_changed, nb, Vp, r, dis_d, pred_d, sync_each);
+    else
+        launch_tiled_round_p<false>(use_dpx, store_changed, nb, Vp, r, dis_d, pred_d, sync_each);
 }
 
 static int derive_grid(FwKernel kernel, int V, bool strided_layout, int block,
@@ -888,7 +1002,7 @@ static const char CSV_HEADER[] =
     "block_threads,grid_blocks,trial,kernel_s,"
     "endtoend_s,energy_j,"
     "mean_power_w,power_samples,energy_counter_j,"
-    "mismatches\n";
+    "mismatches,pred,pred_mismatches\n";
 
 // True when the file is absent or empty, because the run then writes the header
 // itself, and when the header it already holds is the one this program writes.
@@ -952,6 +1066,8 @@ static void print_usage(const char *prog)
     printf("  --device <int>      CUDA and NVML device index (default 0)\n");
     printf("  --csv <path>        append one row per trial to this file\n");
     printf("  --power-csv <path>  write every power sample to this file\n");
+    printf("  --pred              tiled layout: also build the predecessor matrix\n");
+    printf("                      for path reconstruction, and check it\n");
     printf("  --no-verify         skip the closed-form correctness check\n");
     printf("  --help              show this message\n\n");
 }
@@ -970,6 +1086,7 @@ int main(int argc, char **argv)
     bool  verify      = true;
     bool  sync_each   = true;
     bool  store_changed = false;
+    bool  track_pred  = false;
     int   block_threads = BLOCK_THREADS_DEFAULT;
     bool  block_set   = false;
     Topology topo     = TOPO_CHAIN;
@@ -1035,6 +1152,8 @@ int main(int argc, char **argv)
             power_csv_path = argv[++i];
         } else if (!strcmp(argv[i], "--no-verify")) {
             verify = false;
+        } else if (!strcmp(argv[i], "--pred")) {
+            track_pred = true;
         } else {
             fprintf(stderr, "Unknown or incomplete argument: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -1052,6 +1171,10 @@ int main(int argc, char **argv)
     if (block_set && layout == LAYOUT_TILED) {
         fprintf(stderr, "--block does not apply to the tiled layout, whose"
                         " block is fixed at %d x %d threads\n", TILE, TILE);
+        return 1;
+    }
+    if (track_pred && (layout != LAYOUT_TILED || run_cpu)) {
+        fprintf(stderr, "--pred is implemented for the tiled layout on the GPU only\n");
         return 1;
     }
     if (topo == TOPO_SCALE_FREE && (attach < 1 || attach + 1 > V)) {
@@ -1080,7 +1203,16 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    int *dis_d = NULL;
+    int *pred = NULL;
+    if (track_pred) {
+        pred = (int *)malloc(bytes);
+        if (pred == NULL) {
+            fprintf(stderr, "Host allocation of %.2f GB failed\n", bytes / 1e9);
+            return 1;
+        }
+    }
+
+    int *dis_d = NULL, *pred_d = NULL;
     int grid = 0, blocks_per_sm = 0, sm_count = 0;
     cudaDeviceProp prop;
 
@@ -1088,6 +1220,7 @@ int main(int argc, char **argv)
         CUDA_CHECK(cudaSetDevice(device));
         CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
         CUDA_CHECK(cudaMalloc((void **)&dis_d, bytes));
+        if (track_pred) CUDA_CHECK(cudaMalloc((void **)&pred_d, bytes));
 
         if (tiled) {
             // The tiled grids are fixed by the geometry: one block, then
@@ -1122,6 +1255,9 @@ int main(int argc, char **argv)
         printf("# dpx               : %s\n", use_dpx ? "on" : "off");
         printf("# store             : %s\n",
                store_changed ? "only cells that improve" : "every cell");
+        printf("# pred              : %s\n",
+               track_pred ? "on, the predecessor matrix is built and copied"
+                          : "off, distances only");
         if (tiled) {
             printf("# tile              : %d x %d, matrix padded to %d nodes, %d rounds\n",
                    TILE, TILE, Vp, nb);
@@ -1185,6 +1321,14 @@ int main(int argc, char **argv)
         fw_cpu(V, ref);
     }
 
+    // The edges P is checked against, read once from the initial matrix.
+    unsigned char *bits = NULL;
+    if (verify && track_pred) {
+        if (topo == TOPO_CHAIN) init_matrix(V, Vp, dis);
+        else                    init_matrix_edges(V, Vp, dis, edge_u, edge_v, n_edges);
+        bits = edge_bits(V, Vp, dis);
+    }
+
     double *kernel_s   = (double *)calloc(trials, sizeof(double));
     double *endtoend_s = (double *)calloc(trials, sizeof(double));
     double *energy_j   = (double *)calloc(trials, sizeof(double));
@@ -1202,6 +1346,7 @@ int main(int argc, char **argv)
     printf("trial,kernel_s,endtoend_s");
     if (measure_energy) printf(",energy_j,mean_power_w,power_samples,energy_counter_j");
     if (verify) printf(",mismatches");
+    if (verify && track_pred) printf(",pred_mismatches");
     printf("\n");
 
     for (int t = -warmup; t < trials; t++) {
@@ -1212,6 +1357,7 @@ int main(int argc, char **argv)
             init_matrix(V, Vp, dis);
         else
             init_matrix_edges(V, Vp, dis, edge_u, edge_v, n_edges);
+        if (track_pred) init_pred(V, Vp, dis, pred);
 
         double t0 = 0.0, t1 = 0.0, kernel_seconds = 0.0;
         double trial_joules = 0.0;
@@ -1229,12 +1375,14 @@ int main(int argc, char **argv)
             const bool ctr_started = measure_energy && energy_counter_mj(&ctr0);
             t0 = now_seconds();
             CUDA_CHECK(cudaMemcpy(dis_d, dis, bytes, cudaMemcpyHostToDevice));
+            if (track_pred)
+                CUDA_CHECK(cudaMemcpy(pred_d, pred, bytes, cudaMemcpyHostToDevice));
 
             CUDA_CHECK(cudaEventRecord(ev_start, 0));
             if (tiled) {
                 for (int r = 0; r < nb; r++)
-                    launch_tiled_round(use_dpx, store_changed, nb, Vp, r,
-                                       dis_d, sync_each);
+                    launch_tiled_round(use_dpx, store_changed, track_pred, nb,
+                                       Vp, r, dis_d, pred_d, sync_each);
             } else {
                 for (int k = 0; k < V; k++) {
                     launch_relaxation(layout == LAYOUT_COALESCED, use_dpx,
@@ -1257,6 +1405,8 @@ int main(int argc, char **argv)
             kernel_seconds = ms / 1000.0;
 
             CUDA_CHECK(cudaMemcpy(dis, dis_d, bytes, cudaMemcpyDeviceToHost));
+            if (track_pred)
+                CUDA_CHECK(cudaMemcpy(pred, pred_d, bytes, cudaMemcpyDeviceToHost));
             t1 = now_seconds();
             if (ctr_started) ctr_ok = energy_counter_mj(&ctr1);
         }
@@ -1266,6 +1416,9 @@ int main(int argc, char **argv)
             bad = (topo == TOPO_CHAIN)
                 ? count_mismatches(V, Vp, dis)
                 : count_mismatches_ref(V, Vp, dis, ref);
+        long long pbad = 0;
+        if (verify && track_pred)
+            pbad = count_pred_errors(V, Vp, dis, pred, bits);
 
         if (!measured) continue;
 
@@ -1293,6 +1446,7 @@ int main(int argc, char **argv)
             else                  printf(",");
         }
         if (verify) printf(",%lld", bad);
+        if (verify && track_pred) printf(",%lld", pbad);
         printf("\n");
         fflush(stdout);
 
@@ -1319,7 +1473,10 @@ int main(int argc, char **argv)
                     fprintf(f, ",,%d,", nsamp);
                 if (energy_ctr_ok[t]) fprintf(f, "%.3f,", energy_ctr_j[t]);
                 else                  fprintf(f, ",");
-                if (verify) fprintf(f, "%lld\n", bad); else fprintf(f, "\n");
+                if (verify) fprintf(f, "%lld,", bad); else fprintf(f, ",");
+                fprintf(f, "%s,", track_pred ? "on" : "off");
+                if (verify && track_pred) fprintf(f, "%lld\n", pbad);
+                else                      fprintf(f, "\n");
                 fclose(f);
             }
         }
@@ -1376,8 +1533,11 @@ int main(int argc, char **argv)
         CUDA_CHECK(cudaEventDestroy(ev_start));
         CUDA_CHECK(cudaEventDestroy(ev_stop));
         CUDA_CHECK(cudaFree(dis_d));
+        if (pred_d != NULL) CUDA_CHECK(cudaFree(pred_d));
     }
     free(dis);
+    free(pred);
+    free(bits);
     free(ref);
     free(edge_u);
     free(edge_v);
