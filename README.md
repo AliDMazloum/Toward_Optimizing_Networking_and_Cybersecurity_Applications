@@ -277,6 +277,7 @@ detected rather than how long it takes.
 |---|---|---|
 | Routing on the DPA (H200), time and energy, both DPX arms | `app1_scalefree_energy_h200.csv` | `./scripts/run_scalefree_app1.sh h200`, tiled stage: `--layout tiled --store changed --sync per-launch --topology scale-free --energy`, 1000 to 24000 vertices |
 | Routing on the GPGPU (A100), time and energy, both DPX arms | `app1_scalefree_energy_a100.csv` | `./scripts/run_scalefree_app1.sh a100`, the same stage |
+| Routing on the GPGPU (A100), cost of the predecessor matrix, without and with it | `app1_scalefree_pred_a100.csv` | `make a100-sweep` twice, `SWEEP_NODES="1000 2000 3000 6000 12000 24000" SWEEP_TRIALS=5 SWEEP_WARMUP=1`, `SWEEP_FLAGS="--layout tiled --store changed --sync per-launch --topology scale-free"`, the second time with `--pred` added; the `pred` column tells the two apart |
 | Routing, coalesced layout on both GPUs, the layout comparison | `app1_scalefree_flat_h200.csv`, `app1_scalefree_flat_a100.csv` | the same driver, flat stage: `--layout coalesced --store changed --sync per-launch --topology scale-free` |
 | Routing on the CPU, EPYC 9355, 16 and 32 threads | `app1_scalefree_cpu_h200.csv` | the same driver's CPU stages: `--cpu --topology scale-free --no-verify` with `OMP_NUM_THREADS` 32 and then 16 |
 | Routing on the CPU, EPYC 7302P, 16 threads, time and RAPL energy | `app1_scalefree_cpu_epyc.csv` | `./scripts/run_scalefree_app1.sh epyc`, which adds `--energy` |
