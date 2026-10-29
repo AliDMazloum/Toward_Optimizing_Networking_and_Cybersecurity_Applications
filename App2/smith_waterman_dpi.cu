@@ -323,12 +323,12 @@ __host__ __device__ __forceinline__ int score_literal(char p, char s)
     return p == s ? LIT_MATCH : LIT_MISMATCH;
 }
 
+// Written without early returns so that the compiler can use selects instead of a
+// branch chain per signature character; the scores are the same as before.
 __host__ __device__ __forceinline__ int score_regex(char p, char s, bool p_is_digit)
 {
-    if (s == '*') return 0;
-    if (s == '.') return RE_MATCH;
-    if (s == '~') return p_is_digit ? RE_MATCH : RE_MISMATCH;
-    return p == s ? RE_MATCH : RE_MISMATCH;
+    const bool hit = ((p == s) & (s != '~')) | (s == '.') | ((s == '~') & p_is_digit);
+    return s == '*' ? 0 : (hit ? RE_MATCH : RE_MISMATCH);
 }
 
 __host__ __device__ __forceinline__ int gap_regex(char s)
